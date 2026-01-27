@@ -24,117 +24,218 @@
                                password="nuwantha123@"/>
     </db:config>
 
-    <!-- Main Flow for CSV and Excel Files -->
-    <flow name="upload-file-flow" doc:name="Upload File Flow">
+    <!-- Main Flow for Multiple CSV and Excel Files -->
+    <flow name="upload-multiple-files-flow" doc:name="Upload Multiple Files Flow">
         <!-- HTTP Listener -->
-        <http:listener doc:name="Listener" config-ref="HTTP_Listener_config" path="/upload-file" allowedMethods="POST"/>
+        <http:listener doc:name="Listener" config-ref="HTTP_Listener_config" path="/upload-files" allowedMethods="POST"/>
 
-        <!-- Parse File (CSV or Excel) -->
-        <ee:transform doc:name="Parse File" doc:id="a422ce58-2d86-4f02-8acb-2e02a26c194e">
+        <!-- Extract all files from multipart -->
+        <ee:transform doc:name="Extract Files">
             <ee:message>
                 <ee:set-payload><![CDATA[%dw 2.0
 input payload multipart/form-data
-output application/json
-import * from dw::core::Strings
+output application/java
 ---
-do {
-    var fileDisposition = payload.parts.file.headers.'content-disposition' default ""
-    var fileName = lower(fileDisposition as String)
-    var fileContent = payload.parts.file.content
-    var contentType = lower(payload.parts.file.headers.'Content-Type' default "" as String)
-    var isExcel = (fileName contains ".xlsx") or (fileName contains ".xls") or (contentType contains "spreadsheet") or (contentType contains "excel")
-    var isCsv = (fileName contains ".csv") or (contentType contains "csv")
-    ---
-    // Check if it's Excel file
-    if (isExcel)
-        do {
-            // Excel is already parsed as an Object with sheet names as keys
-            var allSheets = fileContent
-            // Get the first sheet (usually "Sheet1" or similar)
-            var sheetNames = namesOf(allSheets)
-            var firstSheetName = sheetNames[0]
-            var firstSheet = allSheets[firstSheetName]
-            ---
-            if (isEmpty(firstSheet))
-                [{ status: "ERROR", message: "Excel file is empty" }]
-            else
-                firstSheet map (row) -> {
-                    source_id: row.id as Number,
-                    name: row.name default "UNKNOWN",
-                    email: row.email default "noemail@example.com",
-                    age: row.age as Number default 0
-                }
-        }
-    // Check if it's CSV file
-    else if (isCsv)
-        do {
-            var csvContent = fileContent
-            ---
-            if (isEmpty(csvContent))
-                [{ status: "ERROR", message: "CSV file is empty" }]
-            else
-                csvContent map (row) -> {
-                    source_id: row.id as Number,
-                    name: row.name default "UNKNOWN",
-                    email: row.email default "noemail@example.com",
-                    age: row.age as Number default 0
-                }
-        }
-    // Unsupported file type
-    else
-        [{ status: "ERROR", message: "Unsupported file type. Please upload CSV or Excel (.xlsx, .xls) files only." }]
+payload.parts pluck (value, key) -> {
+    partName: key,
+    fileContent: value.content,
+    contentType: value.headers.'Content-Type' default "",
+    fileName: value.headers.'Content-Disposition'.filename default ""
 }
 ]]></ee:set-payload>
             </ee:message>
         </ee:transform>
 
-        <!-- Check if error occurred -->
-        <choice doc:name="Check Status">
-            <when expression="#[payload[0].status == 'ERROR']">
-                <ee:transform doc:name="Extract Error">
-                    <ee:message>
-                        <ee:set-payload><![CDATA[%dw 2.0
+        <ee:transform doc:name="Initialize Variables">
+            <ee:message>
+            </ee:message>
+            <ee:variables>
+                <ee:set-variable variableName="totalRecords"><![CDATA[0]]></ee:set-variable>
+                <ee:set-variable variableName="fileResults"><![CDATA[%dw 2.0
 output application/json
 ---
-payload[0]
-]]></ee:set-payload>
-                    </ee:message>
-                </ee:transform>
-            </when>
-            <otherwise>
-                <!-- Insert each record into DB -->
-                <set-variable value="#[sizeOf(payload)]" doc:name="Set Record Count" variableName="recordCount"/>
-                <foreach doc:name="For Each Record" collection="#[payload]">
-                    <db:insert doc:name="Insert Record" config-ref="Database_Config">
-                        <db:sql><![CDATA[
-                            INSERT INTO records (source_id, name, email, age)
-                            VALUES (:source_id, :name, :email, :age)
-                        ]]></db:sql>
-                        <db:input-parameters><![CDATA[#[payload]]]></db:input-parameters>
-                    </db:insert>
-                </foreach>
+[]]]></ee:set-variable>
+            </ee:variables>
+        </ee:transform>
 
-                <!-- Success Response -->
-                <ee:transform doc:name="Return Response">
-                    <ee:message>
-                        <ee:set-payload><![CDATA[%dw 2.0
+        <!-- Process each file -->
+        <foreach doc:name="For Each File" collection="#[payload]">
+            <logger level="INFO" doc:name="Log Processing" message="#['Processing file: ' ++ payload.fileName]"/>
+            
+            <choice doc:name="Is File Upload?">
+                <when expression="#[payload.fileName != '']">
+                    <try doc:name="Try Process File">
+                        <!-- Parse individual file -->
+                        <ee:transform doc:name="Parse File Content">
+                            <ee:message>
+                                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+import * from dw::core::Strings
+---
+do {
+    var fileName = lower(payload.fileName default "")
+    var fileContent = payload.fileContent
+    var contentType = lower(payload.contentType default "")
+    var isExcel = (fileName contains ".xlsx") or (fileName contains ".xls") or (contentType contains "spreadsheet") or (contentType contains "excel")
+    var isCsv = (fileName contains ".csv") or (contentType contains "csv")
+    ---
+    {
+        fileName: payload.fileName,
+        partName: payload.partName,
+        fileType: if (isExcel) "EXCEL" else if (isCsv) "CSV" else "UNKNOWN",
+        records: (
+            if (isExcel)
+                do {
+                    var allSheets = fileContent
+                    var sheetNames = namesOf(allSheets)
+                    var firstSheetName = sheetNames[0]
+                    var firstSheet = allSheets[firstSheetName]
+                    ---
+                    if (isEmpty(firstSheet))
+                        []
+                    else
+                        firstSheet map (row) -> {
+                            source_id: row.id as Number,
+                            name: row.name default "UNKNOWN",
+                            email: row.email default "noemail@example.com",
+                            age: row.age as Number default 0
+                        }
+                }
+            else if (isCsv)
+                do {
+                    var csvContent = fileContent
+                    ---
+                    if (isEmpty(csvContent))
+                        []
+                    else
+                        csvContent map (row) -> {
+                            source_id: row.id as Number,
+                            name: row.name default "UNKNOWN",
+                            email: row.email default "noemail@example.com",
+                            age: row.age as Number default 0
+                        }
+                }
+            else
+                []
+        )
+    }
+}
+]]></ee:set-payload>
+                            </ee:message>
+                        </ee:transform>
+
+                        <!-- Store file metadata -->
+                        <set-variable value="#[payload.fileName]" doc:name="Store File Name" variableName="currentFileName"/>
+                        <set-variable value="#[payload.records]" doc:name="Store Records" variableName="currentRecords"/>
+                        <set-variable value="#[payload.fileType]" doc:name="Store File Type" variableName="currentFileType"/>
+
+                        <!-- Check if valid file and has records -->
+                        <choice doc:name="Check File Validity">
+                            <when expression="#[vars.currentFileType == 'UNKNOWN']">
+                                <ee:transform doc:name="Add Unsupported File Error">
+                                    <ee:message>
+                                    </ee:message>
+                                    <ee:variables>
+                                        <ee:set-variable variableName="fileResults"><![CDATA[%dw 2.0
+output application/json
+---
+vars.fileResults + [{fileName: vars.currentFileName, status: 'ERROR', message: 'Unsupported file type. Only CSV and Excel files are supported.'}]]]></ee:set-variable>
+                                    </ee:variables>
+                                </ee:transform>
+                            </when>
+                            <when expression="#[sizeOf(vars.currentRecords) == 0]">
+                                <ee:transform doc:name="Add Empty File Error">
+                                    <ee:message>
+                                    </ee:message>
+                                    <ee:variables>
+                                        <ee:set-variable variableName="fileResults"><![CDATA[%dw 2.0
+output application/json
+---
+vars.fileResults + [{fileName: vars.currentFileName, status: 'ERROR', message: 'File is empty or has no valid data.'}]]]></ee:set-variable>
+                                    </ee:variables>
+                                </ee:transform>
+                            </when>
+                            <otherwise>
+                                <!-- Insert records into database -->
+                                <set-variable value="#[0]" doc:name="Initialize Inserted Count" variableName="insertedCount"/>
+                                
+                                <foreach doc:name="For Each Record" collection="#[vars.currentRecords]">
+                                    <try doc:name="Try Insert">
+                                        <db:insert doc:name="Insert Record" config-ref="Database_Config">
+                                            <db:sql><![CDATA[INSERT INTO records (source_id, name, email, age) VALUES (:source_id, :name, :email, :age) ON CONFLICT (source_id) DO NOTHING]]></db:sql>
+                                            <db:input-parameters><![CDATA[#[payload]]]></db:input-parameters>
+                                        </db:insert>
+                                        
+                                        <set-variable value="#[vars.insertedCount + 1]" doc:name="Increment Count" variableName="insertedCount"/>
+                                        
+                                        <error-handler>
+                                            <on-error-continue enableNotifications="true" logException="true">
+                                                <logger level="WARN" doc:name="Log Insert Error" message="#['Failed to insert record: ' ++ error.description]"/>
+                                            </on-error-continue>
+                                        </error-handler>
+                                    </try>
+                                </foreach>
+
+                                <!-- Update totals and add success result -->
+                                <set-variable value="#[vars.totalRecords + vars.insertedCount]" doc:name="Update Total" variableName="totalRecords"/>
+                                <ee:transform doc:name="Add Success Result">
+                                    <ee:message>
+                                    </ee:message>
+                                    <ee:variables>
+                                        <ee:set-variable variableName="fileResults"><![CDATA[%dw 2.0
+output application/json
+---
+vars.fileResults + [{fileName: vars.currentFileName, status: 'SUCCESS', recordsProcessed: sizeOf(vars.currentRecords), recordsInserted: vars.insertedCount}]]]></ee:set-variable>
+                                    </ee:variables>
+                                </ee:transform>
+                            </otherwise>
+                        </choice>
+
+                        <!-- Error handler for file processing -->
+                        <error-handler>
+                            <on-error-continue enableNotifications="true" logException="true">
+                                <logger level="ERROR" doc:name="Log Processing Error" message="#['Error processing file: ' ++ error.description]"/>
+                                <ee:transform doc:name="Add Processing Error">
+                                    <ee:message>
+                                    </ee:message>
+                                    <ee:variables>
+                                        <ee:set-variable variableName="fileResults"><![CDATA[%dw 2.0
+output application/json
+---
+vars.fileResults + [{fileName: (vars.currentFileName default 'unknown'), status: 'ERROR', message: error.description}]]]></ee:set-variable>
+                                    </ee:variables>
+                                </ee:transform>
+                            </on-error-continue>
+                        </error-handler>
+                    </try>
+                </when>
+                <otherwise>
+                    <logger level="DEBUG" doc:name="Skip Non-File Part" message="#['Skipping non-file part: ' ++ payload.partName]"/>
+                </otherwise>
+            </choice>
+        </foreach>
+
+        <!-- Build final response -->
+        <ee:transform doc:name="Build Response">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
 output application/json
 ---
 {
-    status: "SUCCESS",
-    message: "File processed successfully",
-    recordsInserted: vars.recordCount default 0
+    status: "COMPLETED",
+    message: "Multiple file upload processed",
+    totalFilesProcessed: sizeOf(vars.fileResults),
+    totalRecordsInserted: vars.totalRecords,
+    results: vars.fileResults
 }
 ]]></ee:set-payload>
-                    </ee:message>
-                </ee:transform>
-            </otherwise>
-        </choice>
+            </ee:message>
+        </ee:transform>
 
-        <!-- Error Handling -->
+        <!-- Global error handler -->
         <error-handler>
             <on-error-continue enableNotifications="true" logException="true">
-                <logger level="ERROR" doc:name="Logger" message="#['Error occurred: ' ++ error.description]"/>
+                <logger level="ERROR" doc:name="Log Global Error" message="#['Global error occurred: ' ++ error.description]"/>
                 <ee:transform doc:name="Error Response">
                     <ee:message>
                         <ee:set-payload><![CDATA[%dw 2.0
@@ -142,7 +243,8 @@ output application/json
 ---
 {
     status: "ERROR",
-    message: error.description
+    message: "An error occurred during file upload processing",
+    error: error.description
 }
 ]]></ee:set-payload>
                     </ee:message>
