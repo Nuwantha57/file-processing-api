@@ -1,0 +1,153 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns:db="http://www.mulesoft.org/schema/mule/db"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
+        http://www.mulesoft.org/schema/mule/db http://www.mulesoft.org/schema/mule/db/current/mule-db.xsd">
+
+    <!-- HTTP Listener Configuration -->
+    <http:listener-config name="HTTP_Listener_config" doc:name="HTTP Listener config">
+        <http:listener-connection host="0.0.0.0" port="8081"/>
+    </http:listener-config>
+
+    <!-- Database Configuration -->
+    <db:config name="Database_Config" doc:name="Database Config">
+        <db:generic-connection url="jdbc:postgresql://localhost:5432/employee_management"
+                               driverClassName="org.postgresql.Driver"
+                               user="postgres"
+                               password="nuwantha123@"/>
+    </db:config>
+
+    <!-- Main Flow for CSV and Excel Files -->
+    <flow name="upload-file-flow" doc:name="Upload File Flow">
+        <!-- HTTP Listener -->
+        <http:listener doc:name="Listener" config-ref="HTTP_Listener_config" path="/upload-file" allowedMethods="POST"/>
+
+        <!-- Parse File (CSV or Excel) -->
+        <ee:transform doc:name="Parse File" doc:id="a422ce58-2d86-4f02-8acb-2e02a26c194e">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+input payload multipart/form-data
+output application/json
+import * from dw::core::Strings
+---
+do {
+    var fileDisposition = payload.parts.file.headers.'content-disposition' default ""
+    var fileName = lower(fileDisposition as String)
+    var fileContent = payload.parts.file.content
+    var contentType = lower(payload.parts.file.headers.'Content-Type' default "" as String)
+    var isExcel = (fileName contains ".xlsx") or (fileName contains ".xls") or (contentType contains "spreadsheet") or (contentType contains "excel")
+    var isCsv = (fileName contains ".csv") or (contentType contains "csv")
+    ---
+    // Check if it's Excel file
+    if (isExcel)
+        do {
+            // Excel is already parsed as an Object with sheet names as keys
+            var allSheets = fileContent
+            // Get the first sheet (usually "Sheet1" or similar)
+            var sheetNames = namesOf(allSheets)
+            var firstSheetName = sheetNames[0]
+            var firstSheet = allSheets[firstSheetName]
+            ---
+            if (isEmpty(firstSheet))
+                [{ status: "ERROR", message: "Excel file is empty" }]
+            else
+                firstSheet map (row) -> {
+                    source_id: row.id as Number,
+                    name: row.name default "UNKNOWN",
+                    email: row.email default "noemail@example.com",
+                    age: row.age as Number default 0
+                }
+        }
+    // Check if it's CSV file
+    else if (isCsv)
+        do {
+            var csvContent = fileContent
+            ---
+            if (isEmpty(csvContent))
+                [{ status: "ERROR", message: "CSV file is empty" }]
+            else
+                csvContent map (row) -> {
+                    source_id: row.id as Number,
+                    name: row.name default "UNKNOWN",
+                    email: row.email default "noemail@example.com",
+                    age: row.age as Number default 0
+                }
+        }
+    // Unsupported file type
+    else
+        [{ status: "ERROR", message: "Unsupported file type. Please upload CSV or Excel (.xlsx, .xls) files only." }]
+}
+]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+
+        <!-- Check if error occurred -->
+        <choice doc:name="Check Status">
+            <when expression="#[payload[0].status == 'ERROR']">
+                <ee:transform doc:name="Extract Error">
+                    <ee:message>
+                        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload[0]
+]]></ee:set-payload>
+                    </ee:message>
+                </ee:transform>
+            </when>
+            <otherwise>
+                <!-- Insert each record into DB -->
+                <set-variable value="#[sizeOf(payload)]" doc:name="Set Record Count" variableName="recordCount"/>
+                <foreach doc:name="For Each Record" collection="#[payload]">
+                    <db:insert doc:name="Insert Record" config-ref="Database_Config">
+                        <db:sql><![CDATA[
+                            INSERT INTO records (source_id, name, email, age)
+                            VALUES (:source_id, :name, :email, :age)
+                        ]]></db:sql>
+                        <db:input-parameters><![CDATA[#[payload]]]></db:input-parameters>
+                    </db:insert>
+                </foreach>
+
+                <!-- Success Response -->
+                <ee:transform doc:name="Return Response">
+                    <ee:message>
+                        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+    status: "SUCCESS",
+    message: "File processed successfully",
+    recordsInserted: vars.recordCount default 0
+}
+]]></ee:set-payload>
+                    </ee:message>
+                </ee:transform>
+            </otherwise>
+        </choice>
+
+        <!-- Error Handling -->
+        <error-handler>
+            <on-error-continue enableNotifications="true" logException="true">
+                <logger level="ERROR" doc:name="Logger" message="#['Error occurred: ' ++ error.description]"/>
+                <ee:transform doc:name="Error Response">
+                    <ee:message>
+                        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+    status: "ERROR",
+    message: error.description
+}
+]]></ee:set-payload>
+                    </ee:message>
+                </ee:transform>
+            </on-error-continue>
+        </error-handler>
+    </flow>
+</mule>
