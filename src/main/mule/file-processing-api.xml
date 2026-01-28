@@ -24,7 +24,7 @@
                                password="nuwantha123@"/>
     </db:config>
 
-    <!-- Main Flow for Multiple CSV and Excel Files -->
+    <!-- Main Flow for Multiple CSV and Excel Files with Validation -->
     <flow name="upload-multiple-files-flow" doc:name="Upload Multiple Files Flow">
         <!-- HTTP Listener -->
         <http:listener doc:name="Listener" config-ref="HTTP_Listener_config" path="/upload-files" allowedMethods="POST"/>
@@ -50,9 +50,24 @@ payload.parts pluck (value, key) -> {
             <ee:message>
             </ee:message>
             <ee:variables>
-                <ee:set-variable variableName="totalRecords"><![CDATA[0]]></ee:set-variable>
+                <ee:set-variable variableName="totalRecords"><![CDATA[%dw 2.0
+output application/java
+---
+0]]></ee:set-variable>
+                <ee:set-variable variableName="totalValid"><![CDATA[%dw 2.0
+output application/java
+---
+0]]></ee:set-variable>
+                <ee:set-variable variableName="totalInvalid"><![CDATA[%dw 2.0
+output application/java
+---
+0]]></ee:set-variable>
                 <ee:set-variable variableName="fileResults"><![CDATA[%dw 2.0
-output application/json
+output application/java
+---
+[]]]></ee:set-variable>
+                <ee:set-variable variableName="processedEmails"><![CDATA[%dw 2.0
+output application/java
 ---
 []]]></ee:set-variable>
             </ee:variables>
@@ -65,11 +80,11 @@ output application/json
             <choice doc:name="Is File Upload?">
                 <when expression="#[payload.fileName != '']">
                     <try doc:name="Try Process File">
-                        <!-- Parse individual file -->
-                        <ee:transform doc:name="Parse File Content">
+                        <!-- Parse and Validate individual file -->
+                        <ee:transform doc:name="Parse and Validate File Content">
                             <ee:message>
                                 <ee:set-payload><![CDATA[%dw 2.0
-output application/json
+output application/java
 import * from dw::core::Strings
 ---
 do {
@@ -78,46 +93,98 @@ do {
     var contentType = lower(payload.contentType default "")
     var isExcel = (fileName contains ".xlsx") or (fileName contains ".xls") or (contentType contains "spreadsheet") or (contentType contains "excel")
     var isCsv = (fileName contains ".csv") or (contentType contains "csv")
+    
+    // Email validation regex pattern
+    fun isValidEmail(email: String): Boolean = 
+        email matches /^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/
+    
+    // Age validation function
+    fun isValidAge(age: Number): Boolean = 
+        age >= 0 and age <= 120
+    
+    // Mandatory field validation
+    fun isValidName(name: String): Boolean = 
+        name != null and trim(name) != "" and trim(name) != "UNKNOWN"
+    
+    // Validate and categorize records
+    fun validateRecord(row) = do {
+        var recordName = trim(row.name default "")
+        var recordEmail = trim(row.email default "")
+        var recordAge = row.age as Number default -1
+        var recordId = row.id as Number default 0
+        
+        var errors = []
+        
+        // Check mandatory fields
+        var nameError = if (!isValidName(recordName)) 
+            ["Name is mandatory and cannot be empty"] 
+            else []
+        
+        var emailMandatoryError = if (recordEmail == "" or recordEmail == "noemail@example.com") 
+            ["Email is mandatory"] 
+            else []
+        
+        // Check email format
+        var emailFormatError = if (recordEmail != "" and recordEmail != "noemail@example.com" and !isValidEmail(recordEmail)) 
+            ["Invalid email format"] 
+            else []
+        
+        // Check age range
+        var ageError = if (!isValidAge(recordAge)) 
+            ["Age must be between 0 and 120"] 
+            else []
+        
+        var allErrors = nameError ++ emailMandatoryError ++ emailFormatError ++ ageError
+        ---
+        {
+            source_id: recordId,
+            name: recordName,
+            email: recordEmail,
+            age: recordAge,
+            isValid: isEmpty(allErrors),
+            errors: allErrors
+        }
+    }
+    
+    var rawRecords = (
+        if (isExcel)
+            do {
+                var allSheets = fileContent
+                var sheetNames = namesOf(allSheets)
+                var firstSheetName = sheetNames[0]
+                var firstSheet = allSheets[firstSheetName]
+                ---
+                if (isEmpty(firstSheet))
+                    []
+                else
+                    firstSheet
+            }
+        else if (isCsv)
+            do {
+                var csvContent = fileContent
+                ---
+                if (isEmpty(csvContent))
+                    []
+                else
+                    csvContent
+            }
+        else
+            []
+    )
+    
+    var validatedRecords = rawRecords map validateRecord($)
+    var validRecords = validatedRecords filter $.isValid
+    var invalidRecords = validatedRecords filter !$.isValid
     ---
     {
         fileName: payload.fileName,
         partName: payload.partName,
         fileType: if (isExcel) "EXCEL" else if (isCsv) "CSV" else "UNKNOWN",
-        records: (
-            if (isExcel)
-                do {
-                    var allSheets = fileContent
-                    var sheetNames = namesOf(allSheets)
-                    var firstSheetName = sheetNames[0]
-                    var firstSheet = allSheets[firstSheetName]
-                    ---
-                    if (isEmpty(firstSheet))
-                        []
-                    else
-                        firstSheet map (row) -> {
-                            source_id: row.id as Number,
-                            name: row.name default "UNKNOWN",
-                            email: row.email default "noemail@example.com",
-                            age: row.age as Number default 0
-                        }
-                }
-            else if (isCsv)
-                do {
-                    var csvContent = fileContent
-                    ---
-                    if (isEmpty(csvContent))
-                        []
-                    else
-                        csvContent map (row) -> {
-                            source_id: row.id as Number,
-                            name: row.name default "UNKNOWN",
-                            email: row.email default "noemail@example.com",
-                            age: row.age as Number default 0
-                        }
-                }
-            else
-                []
-        )
+        totalRecords: sizeOf(validatedRecords),
+        validRecords: validRecords,
+        invalidRecords: invalidRecords,
+        validCount: sizeOf(validRecords),
+        invalidCount: sizeOf(invalidRecords)
     }
 }
 ]]></ee:set-payload>
@@ -126,8 +193,11 @@ do {
 
                         <!-- Store file metadata -->
                         <set-variable value="#[payload.fileName]" doc:name="Store File Name" variableName="currentFileName"/>
-                        <set-variable value="#[payload.records]" doc:name="Store Records" variableName="currentRecords"/>
+                        <set-variable value="#[payload.validRecords]" doc:name="Store Valid Records" variableName="currentValidRecords"/>
+                        <set-variable value="#[payload.invalidRecords]" doc:name="Store Invalid Records" variableName="currentInvalidRecords"/>
                         <set-variable value="#[payload.fileType]" doc:name="Store File Type" variableName="currentFileType"/>
+                        <set-variable value="#[payload.validCount]" doc:name="Store Valid Count" variableName="currentValidCount"/>
+                        <set-variable value="#[payload.invalidCount]" doc:name="Store Invalid Count" variableName="currentInvalidCount"/>
 
                         <!-- Check if valid file and has records -->
                         <choice doc:name="Check File Validity">
@@ -137,55 +207,142 @@ do {
                                     </ee:message>
                                     <ee:variables>
                                         <ee:set-variable variableName="fileResults"><![CDATA[%dw 2.0
-output application/json
+output application/java
 ---
-vars.fileResults + [{fileName: vars.currentFileName, status: 'ERROR', message: 'Unsupported file type. Only CSV and Excel files are supported.'}]]]></ee:set-variable>
+vars.fileResults + [{
+    fileName: vars.currentFileName, 
+    status: 'ERROR', 
+    message: 'Unsupported file type. Only CSV and Excel files are supported.'
+}]]]></ee:set-variable>
                                     </ee:variables>
                                 </ee:transform>
                             </when>
-                            <when expression="#[sizeOf(vars.currentRecords) == 0]">
+                            <when expression="#[vars.currentValidCount == 0 and vars.currentInvalidCount == 0]">
                                 <ee:transform doc:name="Add Empty File Error">
                                     <ee:message>
                                     </ee:message>
                                     <ee:variables>
                                         <ee:set-variable variableName="fileResults"><![CDATA[%dw 2.0
-output application/json
+output application/java
 ---
-vars.fileResults + [{fileName: vars.currentFileName, status: 'ERROR', message: 'File is empty or has no valid data.'}]]]></ee:set-variable>
+vars.fileResults + [{
+    fileName: vars.currentFileName, 
+    status: 'ERROR', 
+    message: 'File is empty or has no valid data.'
+}]]]></ee:set-variable>
                                     </ee:variables>
                                 </ee:transform>
                             </when>
                             <otherwise>
-                                <!-- Insert records into database -->
+                                <!-- Initialize counters for this file -->
                                 <set-variable value="#[0]" doc:name="Initialize Inserted Count" variableName="insertedCount"/>
+                                <set-variable value="#[0]" doc:name="Initialize Duplicate Count" variableName="duplicateCount"/>
                                 
-                                <foreach doc:name="For Each Record" collection="#[vars.currentRecords]">
+                                <!-- Process each valid record -->
+                                <foreach doc:name="For Each Valid Record" collection="#[vars.currentValidRecords]">
                                     <try doc:name="Try Insert">
-                                        <db:insert doc:name="Insert Record" config-ref="Database_Config">
-                                            <db:sql><![CDATA[INSERT INTO records (source_id, name, email, age) VALUES (:source_id, :name, :email, :age) ON CONFLICT (source_id) DO NOTHING]]></db:sql>
-                                            <db:input-parameters><![CDATA[#[payload]]]></db:input-parameters>
-                                        </db:insert>
+                                        <set-variable value="#[payload.email]" doc:name="Store Current Email" variableName="currentEmail"/>
                                         
-                                        <set-variable value="#[vars.insertedCount + 1]" doc:name="Increment Count" variableName="insertedCount"/>
+                                        <!-- Check if email already processed in this batch -->
+                                        <choice doc:name="Check If Email Already Processed">
+                                            <when expression="#[vars.processedEmails contains vars.currentEmail]">
+                                                <!-- Email is duplicate within files -->
+                                                <logger level="WARN" doc:name="Log Duplicate in Batch" message="#['Duplicate email in batch: ' ++ vars.currentEmail]"/>
+                                                <set-variable value="#[vars.duplicateCount + 1]" doc:name="Increment Duplicate Count" variableName="duplicateCount"/>
+                                            </when>
+                                            <otherwise>
+                                                <!-- Check if email exists in database -->
+                                                <db:select doc:name="Check Email in DB" config-ref="Database_Config">
+                                                    <db:sql><![CDATA[SELECT email FROM records WHERE email = :email LIMIT 1]]></db:sql>
+                                                    <db:input-parameters><![CDATA[#[{email: vars.currentEmail}]]]></db:input-parameters>
+                                                </db:select>
+                                                
+                                                <choice doc:name="Email Exists in DB?">
+                                                    <when expression="#[sizeOf(payload) == 0]">
+                                                        <!-- Email doesn't exist, insert it -->
+                                                        <set-payload value="#[vars.currentValidRecords[vars.insertedCount + vars.duplicateCount]]" doc:name="Restore Record"/>
+                                                        
+                                                        <db:insert doc:name="Insert Record" config-ref="Database_Config">
+                                                            <db:sql><![CDATA[INSERT INTO records (source_id, name, email, age) VALUES (:source_id, :name, :email, :age)]]></db:sql>
+                                                            <db:input-parameters><![CDATA[#[payload]]]></db:input-parameters>
+                                                        </db:insert>
+                                                        
+                                                        <logger level="INFO" doc:name="Log Success" message="#['Successfully inserted: ' ++ vars.currentEmail]"/>
+                                                        
+                                                        <set-variable value="#[vars.insertedCount + 1]" doc:name="Increment Inserted" variableName="insertedCount"/>
+                                                        
+                                                        <!-- Add email to processed list -->
+                                                        <ee:transform doc:name="Add to Processed Emails">
+                                                            <ee:message>
+                                                            </ee:message>
+                                                            <ee:variables>
+                                                                <ee:set-variable variableName="processedEmails"><![CDATA[%dw 2.0
+output application/java
+---
+vars.processedEmails + [vars.currentEmail]]]></ee:set-variable>
+                                                            </ee:variables>
+                                                        </ee:transform>
+                                                    </when>
+                                                    <otherwise>
+                                                        <!-- Email already exists in database -->
+                                                        <logger level="WARN" doc:name="Log Duplicate in DB" message="#['Email already exists in database: ' ++ vars.currentEmail]"/>
+                                                        <set-variable value="#[vars.duplicateCount + 1]" doc:name="Increment Duplicate Count for DB" variableName="duplicateCount"/>
+                                                    </otherwise>
+                                                </choice>
+                                            </otherwise>
+                                        </choice>
                                         
                                         <error-handler>
                                             <on-error-continue enableNotifications="true" logException="true">
-                                                <logger level="WARN" doc:name="Log Insert Error" message="#['Failed to insert record: ' ++ error.description]"/>
+                                                <logger level="ERROR" doc:name="Log Insert Error" message="#['Failed to insert record: ' ++ error.description]"/>
                                             </on-error-continue>
                                         </error-handler>
                                     </try>
                                 </foreach>
 
-                                <!-- Update totals and add success result -->
-                                <set-variable value="#[vars.totalRecords + vars.insertedCount]" doc:name="Update Total" variableName="totalRecords"/>
-                                <ee:transform doc:name="Add Success Result">
+                                <!-- Update totals and add file result -->
+                                <ee:transform doc:name="Update Totals">
+                                    <ee:message>
+                                    </ee:message>
+                                    <ee:variables>
+                                        <ee:set-variable variableName="totalRecords"><![CDATA[%dw 2.0
+output application/java
+---
+vars.totalRecords + vars.insertedCount]]></ee:set-variable>
+                                        <ee:set-variable variableName="totalValid"><![CDATA[%dw 2.0
+output application/java
+---
+vars.totalValid + vars.currentValidCount]]></ee:set-variable>
+                                        <ee:set-variable variableName="totalInvalid"><![CDATA[%dw 2.0
+output application/java
+---
+vars.totalInvalid + vars.currentInvalidCount]]></ee:set-variable>
+                                    </ee:variables>
+                                </ee:transform>
+                                
+                                <ee:transform doc:name="Add File Result">
                                     <ee:message>
                                     </ee:message>
                                     <ee:variables>
                                         <ee:set-variable variableName="fileResults"><![CDATA[%dw 2.0
-output application/json
+output application/java
 ---
-vars.fileResults + [{fileName: vars.currentFileName, status: 'SUCCESS', recordsProcessed: sizeOf(vars.currentRecords), recordsInserted: vars.insertedCount}]]]></ee:set-variable>
+vars.fileResults + [{
+    fileName: vars.currentFileName,
+    status: 'SUCCESS',
+    totalRecordsInFile: vars.currentValidCount + vars.currentInvalidCount,
+    validRecords: vars.currentValidCount,
+    invalidRecords: vars.currentInvalidCount,
+    duplicateRecords: vars.duplicateCount,
+    recordsInserted: vars.insertedCount,
+    invalidDetails: vars.currentInvalidRecords map ((record, index) -> {
+        row: index + 1,
+        name: record.name,
+        email: record.email,
+        age: record.age,
+        errors: record.errors
+    })
+}]]]></ee:set-variable>
                                     </ee:variables>
                                 </ee:transform>
                             </otherwise>
@@ -200,9 +357,13 @@ vars.fileResults + [{fileName: vars.currentFileName, status: 'SUCCESS', recordsP
                                     </ee:message>
                                     <ee:variables>
                                         <ee:set-variable variableName="fileResults"><![CDATA[%dw 2.0
-output application/json
+output application/java
 ---
-vars.fileResults + [{fileName: (vars.currentFileName default 'unknown'), status: 'ERROR', message: error.description}]]]></ee:set-variable>
+vars.fileResults + [{
+    fileName: (vars.currentFileName default 'unknown'), 
+    status: 'ERROR', 
+    message: error.description
+}]]]></ee:set-variable>
                                     </ee:variables>
                                 </ee:transform>
                             </on-error-continue>
@@ -223,10 +384,14 @@ output application/json
 ---
 {
     status: "COMPLETED",
-    message: "Multiple file upload processed",
-    totalFilesProcessed: sizeOf(vars.fileResults),
-    totalRecordsInserted: vars.totalRecords,
-    results: vars.fileResults
+    message: "Multiple file upload processed with validation",
+    summary: {
+        totalFilesProcessed: sizeOf(vars.fileResults),
+        totalRecordsInserted: vars.totalRecords,
+        totalValidRecords: vars.totalValid,
+        totalInvalidRecords: vars.totalInvalid
+    },
+    fileResults: vars.fileResults
 }
 ]]></ee:set-payload>
             </ee:message>
