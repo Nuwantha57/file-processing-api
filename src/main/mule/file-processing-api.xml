@@ -131,7 +131,7 @@ output application/json
         </on-error-propagate>
     </error-handler>
 
-    <!-- Main Flow for Multiple CSV and Excel Files with Advanced Error Handling -->
+    <!-- Main Flow for Multiple CSV and Excel Files with Batch Insert -->
     <flow name="upload-multiple-files-flow" doc:name="Upload Multiple Files Flow">
         <!-- HTTP Listener -->
         <http:listener doc:name="Listener" config-ref="HTTP_Listener_config" path="/upload-files" allowedMethods="POST">
@@ -324,37 +324,43 @@ do {
                             </when>
                         </choice>
 
-                        <!-- Store invalid records in DLQ -->
+                        <!-- Batch Store Invalid Records in DLQ -->
                         <choice doc:name="Has Invalid Records?">
                             <when expression="#[vars.currentInvalidCount > 0]">
-                                <foreach doc:name="For Each Invalid Record" collection="#[vars.currentInvalidRecords]">
-                                    <try doc:name="Try Store in DLQ">
-                                        <until-successful maxRetries="3" millisBetweenRetries="2000" doc:name="Retry DLQ Insert">
-                                            <db:insert doc:name="Insert to DLQ" config-ref="Database_Config">
-                                                <db:sql><![CDATA[INSERT INTO dead_letter_queue (source_id, name, email, age, error_message, file_name, created_at) 
-VALUES (:source_id, :name, :email, :age, :error_message, :file_name, CURRENT_TIMESTAMP)]]></db:sql>
-                                                <db:input-parameters><![CDATA[#[{
-    source_id: payload.source_id,
-    name: payload.name,
-    email: payload.email,
-    age: payload.age,
-    error_message: payload.errors joinBy ", ",
+                                <try doc:name="Try Batch Insert DLQ">
+                                    <ee:transform doc:name="Prepare DLQ Batch">
+                                        <ee:message>
+                                            <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+vars.currentInvalidRecords map {
+    source_id: $.source_id,
+    name: $.name,
+    email: $.email,
+    age: $.age,
+    error_message: $.errors joinBy ", ",
     file_name: vars.currentFileName
-}]]]></db:input-parameters>
-                                            </db:insert>
-                                        </until-successful>
-                                        
-                                        <error-handler>
-                                            <on-error-continue enableNotifications="true" logException="true">
-                                                <logger level="ERROR" doc:name="Log DLQ Failure" message="#['Failed to store record in DLQ after retries: ' ++ error.description]"/>
-                                            </on-error-continue>
-                                        </error-handler>
-                                    </try>
-                                </foreach>
+}]]></ee:set-payload>
+                                        </ee:message>
+                                    </ee:transform>
+                                    
+                                    <until-successful maxRetries="3" millisBetweenRetries="2000" doc:name="Retry DLQ Batch Insert">
+                                        <db:bulk-insert doc:name="Batch Insert to DLQ" config-ref="Database_Config">
+                                            <db:sql><![CDATA[INSERT INTO dead_letter_queue (source_id, name, email, age, error_message, file_name, created_at) 
+VALUES (:source_id, :name, :email, :age, :error_message, :file_name, CURRENT_TIMESTAMP)]]></db:sql>
+                                        </db:bulk-insert>
+                                    </until-successful>
+                                    
+                                    <error-handler>
+                                        <on-error-continue enableNotifications="true" logException="true">
+                                            <logger level="ERROR" doc:name="Log DLQ Batch Failure" message="#['Failed to batch insert records to DLQ after retries: ' ++ error.description]"/>
+                                        </on-error-continue>
+                                    </error-handler>
+                                </try>
                             </when>
                         </choice>
 
-                        <!-- Process valid records -->
+                        <!-- Process valid records with batch insert -->
                         <choice doc:name="Has Valid Records?">
                             <when expression="#[vars.currentValidCount > 0]">
                                 <!-- Check for duplicate emails -->
@@ -398,83 +404,137 @@ do {
                                 <set-variable value="#[payload.duplicateRecords]" doc:name="Store Duplicate Records" variableName="duplicateRecords"/>
                                 <set-variable value="#[payload.duplicateCount]" doc:name="Store Duplicate Count" variableName="duplicateCount"/>
 
-                                <!-- Insert valid non-duplicate records with retry logic -->
-                                <set-variable value="#[0]" doc:name="Initialize Inserted Count" variableName="insertedCount"/>
-                                <set-variable value="#[0]" doc:name="Initialize Failed Count" variableName="failedCount"/>
-                                
-                                <foreach doc:name="For Each Valid Record" collection="#[vars.recordsToInsert]">
-                                    <set-variable value="#[payload]" doc:name="Store Current Record" variableName="currentRecord"/>
-                                    
-                                    <try doc:name="Try Insert with Retry">
-                                        <!-- Check if email already exists in database -->
-                                        <db:select doc:name="Check Email in DB" config-ref="Database_Config">
-                                            <db:sql><![CDATA[SELECT email FROM records WHERE email = :email LIMIT 1]]></db:sql>
-                                            <db:input-parameters><![CDATA[#[{email: vars.currentRecord.email}]]]></db:input-parameters>
+                                <!-- Check for existing emails in database using IN clause -->
+                                <choice doc:name="Has Records to Insert?">
+                                    <when expression="#[sizeOf(vars.recordsToInsert) > 0]">
+                                        <ee:transform doc:name="Build IN Clause">
+                                            <ee:message>
+                                                <ee:set-payload><![CDATA[%dw 2.0
+output application/java
+---
+{
+    emailList: "'" ++ (vars.recordsToInsert map $.email joinBy "','") ++ "'"
+}]]></ee:set-payload>
+                                            </ee:message>
+                                        </ee:transform>
+                                        
+                                        <db:select doc:name="Batch Check Emails in DB" config-ref="Database_Config">
+                                            <db:sql><![CDATA[#["SELECT email FROM records WHERE email IN (" ++ payload.emailList ++ ")"]]]></db:sql>
                                         </db:select>
                                         
-                                        <choice doc:name="Email Exists in DB?">
-                                            <when expression="#[sizeOf(payload) == 0]">
-                                                <!-- Email doesn't exist, insert it with retry -->
-                                                <set-payload value="#[vars.currentRecord]" doc:name="Restore Record"/>
-                                                
-                                                <until-successful maxRetries="3" millisBetweenRetries="2000" doc:name="Retry Insert">
-                                                    <db:insert doc:name="Insert Record" config-ref="Database_Config">
-                                                        <db:sql><![CDATA[INSERT INTO records (source_id, name, email, age) VALUES (:source_id, :name, :email, :age) ON CONFLICT (source_id) DO NOTHING]]></db:sql>
-                                                        <db:input-parameters><![CDATA[#[vars.currentRecord]]]></db:input-parameters>
-                                                    </db:insert>
-                                                </until-successful>
-                                                
-                                                <set-variable value="#[vars.insertedCount + 1]" doc:name="Increment Inserted" variableName="insertedCount"/>
-                                                
-                                                <!-- Add email to processed list -->
-                                                <ee:transform doc:name="Add to Processed Emails">
-                                                    <ee:message>
-                                                    </ee:message>
-                                                    <ee:variables>
-                                                        <ee:set-variable variableName="processedEmails"><![CDATA[%dw 2.0
+                                        <set-variable value="#[payload]" doc:name="Store Existing Emails" variableName="existingEmailsInDb"/>
+                                        
+                                        <!-- Filter out emails that exist in database -->
+                                        <ee:transform doc:name="Filter Non-Duplicate Records">
+                                            <ee:message>
+                                                <ee:set-payload><![CDATA[%dw 2.0
 output application/json
 ---
-vars.processedEmails + [vars.currentRecord.email]]]></ee:set-variable>
-                                                    </ee:variables>
-                                                </ee:transform>
-                                            </when>
-                                            <otherwise>
-                                                <logger level="WARN" doc:name="Log Duplicate Email" message="#['Email already exists in database: ' ++ vars.currentRecord.email]"/>
-                                            </otherwise>
-                                        </choice>
+do {
+    var existingEmails = vars.existingEmailsInDb map $.email
+    var recordsToInsert = vars.recordsToInsert filter !(existingEmails contains $.email)
+    ---
+    {
+        recordsToInsert: recordsToInsert,
+        existingEmailCount: sizeOf(existingEmails)
+    }
+}]]></ee:set-payload>
+                                            </ee:message>
+                                        </ee:transform>
                                         
-                                        <!-- Error handler for failed inserts - Store in DLQ -->
-                                        <error-handler>
-                                            <on-error-continue enableNotifications="true" logException="true">
-                                                <logger level="ERROR" doc:name="Log Insert Failure" message="#['Failed to insert record after retries: ' ++ error.description]"/>
+                                        <set-variable value="#[payload.recordsToInsert]" doc:name="Update Insertable Records" variableName="finalRecordsToInsert"/>
+                                        <set-variable value="#[payload.existingEmailCount]" doc:name="Store Existing Count" variableName="existingEmailCount"/>
+                                        
+                                        <!-- Batch Insert Valid Non-Duplicate Records -->
+                                        <choice doc:name="Has Final Records?">
+                                            <when expression="#[sizeOf(vars.finalRecordsToInsert) > 0]">
+                                                <set-variable value="#[0]" doc:name="Initialize Inserted Count" variableName="insertedCount"/>
+                                                <set-variable value="#[0]" doc:name="Initialize Failed Count" variableName="failedCount"/>
                                                 
-                                                <set-variable value="#[vars.failedCount + 1]" doc:name="Increment Failed" variableName="failedCount"/>
-                                                
-                                                <!-- Store failed record in DLQ -->
-                                                <try doc:name="Try Store Failed in DLQ">
-                                                    <db:insert doc:name="Insert Failed to DLQ" config-ref="Database_Config">
-                                                        <db:sql><![CDATA[INSERT INTO dead_letter_queue (source_id, name, email, age, error_message, file_name, created_at) 
-VALUES (:source_id, :name, :email, :age, :error_message, :file_name, CURRENT_TIMESTAMP)]]></db:sql>
-                                                        <db:input-parameters><![CDATA[#[{
-    source_id: vars.currentRecord.source_id,
-    name: vars.currentRecord.name,
-    email: vars.currentRecord.email,
-    age: vars.currentRecord.age,
-    error_message: "Database insert failed: " ++ error.description,
-    file_name: vars.currentFileName
-}]]]></db:input-parameters>
-                                                    </db:insert>
+                                                <try doc:name="Try Batch Insert">
+                                                    <ee:transform doc:name="Prepare Batch Insert">
+                                                        <ee:message>
+                                                            <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+vars.finalRecordsToInsert]]></ee:set-payload>
+                                                        </ee:message>
+                                                    </ee:transform>
                                                     
+                                                    <until-successful maxRetries="3" millisBetweenRetries="2000" doc:name="Retry Batch Insert">
+                                                        <db:bulk-insert doc:name="Batch Insert Records" config-ref="Database_Config">
+                                                            <db:sql><![CDATA[INSERT INTO records (source_id, name, email, age) 
+VALUES (:source_id, :name, :email, :age) 
+ON CONFLICT (source_id) DO NOTHING]]></db:sql>
+                                                        </db:bulk-insert>
+                                                    </until-successful>
+                                                    
+                                                    <set-variable value="#[sizeOf(vars.finalRecordsToInsert)]" doc:name="Set Inserted Count" variableName="insertedCount"/>
+                                                    
+                                                    <!-- Add emails to processed list -->
+                                                    <ee:transform doc:name="Add to Processed Emails">
+                                                        <ee:message>
+                                                        </ee:message>
+                                                        <ee:variables>
+                                                            <ee:set-variable variableName="processedEmails"><![CDATA[%dw 2.0
+output application/json
+---
+vars.processedEmails ++ (vars.finalRecordsToInsert map $.email)]]></ee:set-variable>
+                                                        </ee:variables>
+                                                    </ee:transform>
+                                                    
+                                                    <!-- Error handler for failed batch insert -->
                                                     <error-handler>
                                                         <on-error-continue enableNotifications="true" logException="true">
-                                                            <logger level="ERROR" doc:name="Log DLQ Failure" message="#['Failed to store failed record in DLQ: ' ++ error.description]"/>
+                                                            <logger level="ERROR" doc:name="Log Batch Insert Failure" message="#['Failed to batch insert records after retries: ' ++ error.description]"/>
+                                                            
+                                                            <set-variable value="#[sizeOf(vars.finalRecordsToInsert)]" doc:name="Set Failed Count" variableName="failedCount"/>
+                                                            
+                                                            <!-- Store all failed records in DLQ as batch -->
+                                                            <try doc:name="Try Store Failed Batch in DLQ">
+                                                                <ee:transform doc:name="Prepare Failed Batch for DLQ">
+                                                                    <ee:message>
+                                                                        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+vars.finalRecordsToInsert map {
+    source_id: $.source_id,
+    name: $.name,
+    email: $.email,
+    age: $.age,
+    error_message: "Database batch insert failed: " ++ error.description,
+    file_name: vars.currentFileName
+}]]></ee:set-payload>
+                                                                    </ee:message>
+                                                                </ee:transform>
+                                                                
+                                                                <db:bulk-insert doc:name="Batch Insert Failed to DLQ" config-ref="Database_Config">
+                                                                    <db:sql><![CDATA[INSERT INTO dead_letter_queue (source_id, name, email, age, error_message, file_name, created_at) 
+VALUES (:source_id, :name, :email, :age, :error_message, :file_name, CURRENT_TIMESTAMP)]]></db:sql>
+                                                                </db:bulk-insert>
+                                                                
+                                                                <error-handler>
+                                                                    <on-error-continue enableNotifications="true" logException="true">
+                                                                        <logger level="ERROR" doc:name="Log DLQ Batch Failure" message="#['Failed to batch insert failed records to DLQ: ' ++ error.description]"/>
+                                                                    </on-error-continue>
+                                                                </error-handler>
+                                                            </try>
                                                         </on-error-continue>
                                                     </error-handler>
                                                 </try>
-                                            </on-error-continue>
-                                        </error-handler>
-                                    </try>
-                                </foreach>
+                                            </when>
+                                            <otherwise>
+                                                <set-variable value="#[0]" doc:name="Set Zero Inserted" variableName="insertedCount"/>
+                                                <set-variable value="#[0]" doc:name="Set Zero Failed" variableName="failedCount"/>
+                                            </otherwise>
+                                        </choice>
+                                    </when>
+                                    <otherwise>
+                                        <set-variable value="#[0]" doc:name="No Records to Insert" variableName="insertedCount"/>
+                                        <set-variable value="#[0]" doc:name="No Failed Records" variableName="failedCount"/>
+                                        <set-variable value="#[0]" doc:name="No Existing Emails" variableName="existingEmailCount"/>
+                                    </otherwise>
+                                </choice>
 
                                 <!-- Update totals -->
                                 <ee:transform doc:name="Update Totals">
@@ -516,7 +576,7 @@ vars.fileResults + [{
     totalRecordsInFile: vars.currentValidCount + vars.currentInvalidCount,
     validRecords: vars.currentValidCount,
     invalidRecords: vars.currentInvalidCount,
-    duplicateRecords: vars.duplicateCount default 0,
+    duplicateRecords: (vars.duplicateCount default 0) + (vars.existingEmailCount default 0),
     recordsInserted: vars.insertedCount default 0,
     recordsFailed: vars.failedCount default 0,
     invalidDetails: vars.currentInvalidRecords map {
@@ -588,7 +648,7 @@ output application/json
 ---
 {
     status: "COMPLETED",
-    message: "Multiple file upload processed with validation",
+    message: "Multiple file upload processed with batch validation and insertion",
     summary: {
         totalFilesProcessed: sizeOf(vars.fileResults),
         totalRecordsInserted: vars.totalRecords,
