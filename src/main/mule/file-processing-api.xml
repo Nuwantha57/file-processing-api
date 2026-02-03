@@ -2,6 +2,7 @@
 <mule xmlns:db="http://www.mulesoft.org/schema/mule/db"
       xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
       xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:secure-properties="http://www.mulesoft.org/schema/mule/secure-properties"
       xmlns="http://www.mulesoft.org/schema/mule/core"
       xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
       xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
@@ -9,27 +10,38 @@
         http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
         http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
         http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
-        http://www.mulesoft.org/schema/mule/db http://www.mulesoft.org/schema/mule/db/current/mule-db.xsd">
+        http://www.mulesoft.org/schema/mule/db http://www.mulesoft.org/schema/mule/db/current/mule-db.xsd
+        http://www.mulesoft.org/schema/mule/secure-properties http://www.mulesoft.org/schema/mule/secure-properties/current/mule-secure-properties.xsd">
+        
+        
+        <!-- Regular properties -->
+    <configuration-properties file="config/dev.properties" doc:name="Configuration Properties"/>
+    
+    <!-- Secure properties -->
+    <secure-properties:config name="Secure_Properties_Config" 
+        file="config/secure.properties" 
+        key="${encryption.key}" 
+        doc:name="Secure Properties Config">
+        <secure-properties:encrypt algorithm="AES" mode="CBC"/>
+    </secure-properties:config>
 
     <!-- HTTP Listener Configuration -->
     <http:listener-config name="HTTP_Listener_config" doc:name="HTTP Listener config">
-        <http:listener-connection host="0.0.0.0" port="8081"/>
+        <http:listener-connection host="${http.host}" port="${http.port}"/>
     </http:listener-config>
 
     <!-- Database Configuration with Connection Pooling and Timeout -->
     <db:config name="Database_Config" doc:name="Database Config">
-        <db:generic-connection url="jdbc:postgresql://localhost:5432/employee_management?connectTimeout=30&amp;socketTimeout=30"
-                               driverClassName="org.postgresql.Driver"
-                               user="postgres"
-                               password="nuwantha123@"
-                               transactionIsolation="READ_COMMITTED">
-            <reconnection>
-                <reconnect frequency="5000" count="3"/>
-            </reconnection>
-            <db:pooling-profile maxPoolSize="10" minPoolSize="2" acquireIncrement="1" 
-                               preparedStatementCacheSize="10" maxWait="30000"/>
-        </db:generic-connection>
-    </db:config>
+	    <db:generic-connection 
+	        url="jdbc:postgresql://${db.host}:${db.port}/${db.name}"
+	        driverClassName="org.postgresql.Driver"
+	        user="${db.user}"
+	        password="${secure::db.password}">
+	        <!-- Notice the secure:: prefix -->
+	    </db:generic-connection>
+	</db:config>
+	
+	
 
     <!-- Global Error Handler Configuration -->
     <error-handler name="Global_Error_Handler" doc:name="Global Error Handler">
