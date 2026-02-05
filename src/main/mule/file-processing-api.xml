@@ -16,7 +16,7 @@
         <http:listener-connection host="0.0.0.0" port="8081"/>
     </http:listener-config>
 
-    <!-- Database Configuration with Connection Pooling and Timeout -->
+    <!-- Database Configuration -->
     <db:config name="Database_Config" doc:name="Database Config">
         <db:generic-connection url="jdbc:postgresql://localhost:5432/employee_management?connectTimeout=30&amp;socketTimeout=30"
                                driverClassName="org.postgresql.Driver"
@@ -33,7 +33,6 @@
 
     <!-- Global Error Handler Configuration -->
     <error-handler name="Global_Error_Handler" doc:name="Global Error Handler">
-        <!-- 400 - Bad Request (Invalid File Format) -->
         <on-error-propagate type="MULE:EXPRESSION" enableNotifications="true" logException="true">
             <logger level="ERROR" doc:name="Log Bad Request" 
                     message="#[output application/java --- '[ERROR] Bad Request | CorrelationID: ' ++ correlationId ++ ' | Error: ' ++ (error.description default 'Unknown error') ++ ' | Timestamp: ' ++ (now() as String)]"/>
@@ -55,11 +54,8 @@ output application/json
                     <ee:set-variable variableName="httpStatus">400</ee:set-variable>
                 </ee:variables>
             </ee:transform>
-            <set-payload value="#[payload]" doc:name="Set Payload"/>
-            <set-variable value="400" doc:name="Set Status 400" variableName="httpStatus"/>
         </on-error-propagate>
 
-        <!-- 422 - Validation Errors -->
         <on-error-propagate type="APP:VALIDATION_ERROR" enableNotifications="true" logException="true">
             <logger level="WARN" doc:name="Log Validation Error" 
                     message="#[output application/java --- '[WARN] Validation Error | CorrelationID: ' ++ correlationId ++ ' | Error: ' ++ (error.description default 'Unknown error') ++ ' | Timestamp: ' ++ (now() as String)]"/>
@@ -82,11 +78,8 @@ output application/json
                     <ee:set-variable variableName="httpStatus">422</ee:set-variable>
                 </ee:variables>
             </ee:transform>
-            <set-payload value="#[payload]" doc:name="Set Payload"/>
-            <set-variable value="422" doc:name="Set Status 422" variableName="httpStatus"/>
         </on-error-propagate>
 
-        <!-- 500 - Database/System Failures -->
         <on-error-propagate type="DB:CONNECTIVITY, DB:QUERY_EXECUTION, MULE:CONNECTIVITY" enableNotifications="true" logException="true">
             <logger level="ERROR" doc:name="Log System Error" 
                     message="#[output application/java --- '[ERROR] System Error | CorrelationID: ' ++ correlationId ++ ' | Error: ' ++ (error.description default 'Unknown error') ++ ' | Timestamp: ' ++ (now() as String)]"/>
@@ -108,11 +101,8 @@ output application/json
                     <ee:set-variable variableName="httpStatus">500</ee:set-variable>
                 </ee:variables>
             </ee:transform>
-            <set-payload value="#[payload]" doc:name="Set Payload"/>
-            <set-variable value="500" doc:name="Set Status 500" variableName="httpStatus"/>
         </on-error-propagate>
 
-        <!-- Catch All Other Errors - 500 -->
         <on-error-propagate type="ANY" enableNotifications="true" logException="true">
             <logger level="ERROR" doc:name="Log Unexpected Error" 
                     message="#[output application/java --- '[ERROR] Unexpected Error | CorrelationID: ' ++ correlationId ++ ' | Error: ' ++ (error.description default 'Unknown error') ++ ' | Timestamp: ' ++ (now() as String)]"/>
@@ -134,16 +124,13 @@ output application/json
                     <ee:set-variable variableName="httpStatus">500</ee:set-variable>
                 </ee:variables>
             </ee:transform>
-            <set-payload value="#[payload]" doc:name="Set Payload"/>
-            <set-variable value="500" doc:name="Set Status 500" variableName="httpStatus"/>
         </on-error-propagate>
     </error-handler>
 
-    <!-- Main Flow for Multiple CSV and Excel Files with Batch Insert -->
-    <flow name="upload-multiple-files-flow" doc:name="Upload Multiple Files Flow">
-        <!-- HTTP Listener -->
+    <!-- Main Async Upload Flow -->
+    <flow name="upload-files-async-flow" doc:name="Upload Files Async Flow">
         <http:listener doc:name="Listener" config-ref="HTTP_Listener_config" path="/upload-files" allowedMethods="POST">
-            <http:response statusCode="#[vars.httpStatus default 200]">
+            <http:response statusCode="#[vars.httpStatus default 202]">
                 <http:headers><![CDATA[#[{'Content-Type': 'application/json'}]]]></http:headers>
             </http:response>
             <http:error-response statusCode="#[vars.httpStatus default 500]">
@@ -151,18 +138,14 @@ output application/json
             </http:error-response>
         </http:listener>
 
-        <!-- Capture Request Start Time -->
         <set-variable value="#[now()]" doc:name="Set Request Start Time" variableName="requestStartTime"/>
         
-        <!-- Log Request Received -->
         <logger level="INFO" doc:name="Log Request Received" 
-                message="#[output application/java --- '[INFO] Request Received | CorrelationID: ' ++ correlationId ++ ' | Endpoint: /upload-files | Method: POST | Timestamp: ' ++ (vars.requestStartTime as String)]"/>
+                message="#[output application/java --- '[INFO] Request Received | CorrelationID: ' ++ correlationId ++ ' | Endpoint: /upload-files | Timestamp: ' ++ (vars.requestStartTime as String)]"/>
 
         <!-- Validate Request has files -->
         <choice doc:name="Has Multipart Data?">
             <when expression="#[payload == null]">
-                <logger level="ERROR" doc:name="Log No Files" 
-                        message="#[output application/java --- '[ERROR] No Files Provided | CorrelationID: ' ++ correlationId ++ ' | Timestamp: ' ++ (now() as String)]"/>
                 <raise-error type="APP:VALIDATION_ERROR" description="No files provided in request"/>
             </when>
         </choice>
@@ -183,18 +166,64 @@ payload.parts pluck (value, key) -> {
             </ee:message>
         </ee:transform>
 
+        <!-- Filter to actual files -->
+        <ee:transform doc:name="Filter Files">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/java
+---
+payload filter ($.fileName != "")]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+
         <!-- Validate at least one file exists -->
         <choice doc:name="Has Files?">
-            <when expression="#[sizeOf(payload filter ($.fileName != '')) == 0]">
-                <logger level="ERROR" doc:name="Log Invalid Files" 
-                        message="#[output application/java --- '[ERROR] No Valid Files Found | CorrelationID: ' ++ correlationId ++ ' | Timestamp: ' ++ (now() as String)]"/>
+            <when expression="#[sizeOf(payload) == 0]">
                 <raise-error type="APP:VALIDATION_ERROR" description="No valid files found in request. Please upload CSV or Excel files."/>
             </when>
         </choice>
 
-        <!-- Log File Count -->
+        <set-variable value="#[sizeOf(payload)]" doc:name="Store File Count" variableName="fileCount"/>
+        <set-variable value="#[correlationId]" doc:name="Store Correlation ID" variableName="requestCorrelationId"/>
+        
         <logger level="INFO" doc:name="Log Files Detected" 
-                message="#[output application/java --- '[INFO] Files Detected | CorrelationID: ' ++ correlationId ++ ' | TotalFiles: ' ++ sizeOf(payload filter ($.fileName != '')) ++ ' | Timestamp: ' ++ (now() as String)]"/>
+                message="#[output application/java --- '[INFO] Files Detected | CorrelationID: ' ++ correlationId ++ ' | FileCount: ' ++ vars.fileCount ++ ' | Timestamp: ' ++ (now() as String)]"/>
+
+        <!-- Process files asynchronously -->
+        <async doc:name="Async Processing">
+            <flow-ref name="process-files-worker-flow" doc:name="Process Files"/>
+        </async>
+
+        <!-- Immediate 202 response -->
+        <ee:transform doc:name="Build 202 Response">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+    status: "ACCEPTED",
+    message: "Files queued for asynchronous processing",
+    correlationId: vars.requestCorrelationId,
+    filesQueued: vars.fileCount,
+    timestamp: now()
+}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+
+        <set-variable value="202" doc:name="Set Status 202" variableName="httpStatus"/>
+
+        <logger level="INFO" doc:name="Log Response Sent" 
+                message="#[output application/java --- '[INFO] 202 Response Sent | CorrelationID: ' ++ vars.requestCorrelationId ++ ' | Timestamp: ' ++ (now() as String)]"/>
+
+        <error-handler ref="Global_Error_Handler"/>
+    </flow>
+
+    <!-- Worker Flow - Processes Files -->
+    <flow name="process-files-worker-flow" doc:name="Process Files Worker Flow">
+        <logger level="INFO" doc:name="Log Worker Started" 
+                message="#[output application/java --- '[INFO] [WORKER] Processing started | CorrelationID: ' ++ correlationId ++ ' | FileCount: ' ++ sizeOf(payload) ++ ' | Timestamp: ' ++ (now() as String)]"/>
+
+        <set-variable value="#[now()]" doc:name="Set Worker Start Time" variableName="workerStartTime"/>
 
         <ee:transform doc:name="Initialize Variables">
             <ee:message>
@@ -204,45 +233,25 @@ payload.parts pluck (value, key) -> {
                 <ee:set-variable variableName="totalValid"><![CDATA[0]]></ee:set-variable>
                 <ee:set-variable variableName="totalInvalid"><![CDATA[0]]></ee:set-variable>
                 <ee:set-variable variableName="totalFailed"><![CDATA[0]]></ee:set-variable>
-                <ee:set-variable variableName="fileResults"><![CDATA[%dw 2.0
-output application/json
----
-[]]]></ee:set-variable>
                 <ee:set-variable variableName="processedEmails"><![CDATA[%dw 2.0
 output application/json
 ---
 []]]></ee:set-variable>
-                <ee:set-variable variableName="fileCounter"><![CDATA[0]]></ee:set-variable>
             </ee:variables>
         </ee:transform>
 
         <!-- Process each file -->
         <foreach doc:name="For Each File" collection="#[payload]">
-            <!-- Increment File Counter -->
-            <ee:transform doc:name="Increment Counter">
-                <ee:message>
-                </ee:message>
-                <ee:variables>
-                    <ee:set-variable variableName="fileCounter"><![CDATA[%dw 2.0
-output application/json
----
-vars.fileCounter + 1]]></ee:set-variable>
-                </ee:variables>
-            </ee:transform>
-            
-            <!-- Set File Start Time -->
             <set-variable value="#[now()]" doc:name="Set File Start Time" variableName="fileStartTime"/>
             
             <logger level="INFO" doc:name="Log File Processing Start" 
-                    message="#[output application/java --- '[INFO] File Processing Started | CorrelationID: ' ++ correlationId ++ ' | FileNumber: ' ++ vars.fileCounter ++ ' | FileName: ' ++ payload.fileName ++ ' | StartTime: ' ++ (vars.fileStartTime as String)]"/>
+                    message="#[output application/java --- '[INFO] [WORKER] File Processing Started | CorrelationID: ' ++ correlationId ++ ' | FileName: ' ++ payload.fileName ++ ' | Timestamp: ' ++ (now() as String)]"/>
             
-            <choice doc:name="Is File Upload?">
-                <when expression="#[payload.fileName != '']">
-                    <try doc:name="Try Process File">
-                        <!-- Parse and Validate individual file -->
-                        <ee:transform doc:name="Parse and Validate File Content">
-                            <ee:message>
-                                <ee:set-payload><![CDATA[%dw 2.0
+            <try doc:name="Try Process File">
+                <!-- Parse and Validate individual file -->
+                <ee:transform doc:name="Parse and Validate File">
+                    <ee:message>
+                        <ee:set-payload><![CDATA[%dw 2.0
 output application/json
 import * from dw::core::Strings
 ---
@@ -253,19 +262,15 @@ do {
     var isExcel = (fileName contains ".xlsx") or (fileName contains ".xls") or (contentType contains "spreadsheet") or (contentType contains "excel")
     var isCsv = (fileName contains ".csv") or (contentType contains "csv")
     
-    // Email validation regex pattern
     fun isValidEmail(email: String): Boolean = 
         email matches /^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/
     
-    // Age validation function
     fun isValidAge(age: Number): Boolean = 
         age >= 0 and age <= 120
     
-    // Mandatory field validation
     fun isValidName(name: String): Boolean = 
         name != null and trim(name) != "" and trim(name) != "UNKNOWN"
     
-    // Validate and categorize records
     fun validateRecord(row) = do {
         var recordName = trim(row.name default "")
         var recordEmail = trim(row.email default "")
@@ -274,7 +279,6 @@ do {
         
         var errors = []
         
-        // Check mandatory fields
         var nameError = if (!isValidName(recordName)) 
             ["Name is mandatory and cannot be empty"] 
             else []
@@ -283,12 +287,10 @@ do {
             ["Email is mandatory"] 
             else []
         
-        // Check email format
         var emailFormatError = if (recordEmail != "" and recordEmail != "noemail@example.com" and !isValidEmail(recordEmail)) 
             ["Invalid email format"] 
             else []
         
-        // Check age range
         var ageError = if (!isValidAge(recordAge)) 
             ["Age must be between 0 and 120"] 
             else []
@@ -305,31 +307,12 @@ do {
         }
     }
     
-    var rawRecords = (
-        if (isExcel)
-            do {
-                var allSheets = fileContent
-                var sheetNames = namesOf(allSheets)
-                var firstSheetName = sheetNames[0]
-                var firstSheet = allSheets[firstSheetName]
-                ---
-                if (isEmpty(firstSheet))
-                    []
-                else
-                    firstSheet
-            }
-        else if (isCsv)
-            do {
-                var csvContent = fileContent
-                ---
-                if (isEmpty(csvContent))
-                    []
-                else
-                    csvContent
-            }
-        else
-            []
-    )
+    var rawRecords =
+        if (isExcel) 
+            if (isEmpty(fileContent[namesOf(fileContent)[0]])) [] else fileContent[namesOf(fileContent)[0]]
+        else if (isCsv) 
+            if (isEmpty(fileContent)) [] else fileContent
+        else []
     
     var validatedRecords = rawRecords map validateRecord($)
     var validRecords = validatedRecords filter $.isValid
@@ -337,7 +320,6 @@ do {
     ---
     {
         fileName: payload.fileName,
-        partName: payload.partName,
         fileType: if (isExcel) "EXCEL" else if (isCsv) "CSV" else "UNKNOWN",
         totalRecords: sizeOf(validatedRecords),
         validRecords: validRecords,
@@ -346,42 +328,35 @@ do {
         invalidCount: sizeOf(invalidRecords)
     }
 }]]></ee:set-payload>
-                            </ee:message>
-                        </ee:transform>
+                    </ee:message>
+                </ee:transform>
 
-                        <!-- Log File Parsing Results -->
-                        <logger level="INFO" doc:name="Log File Parsing Results" 
-                                message="#[output application/java --- '[INFO] File Parsed | CorrelationID: ' ++ correlationId ++ ' | FileName: ' ++ payload.fileName ++ ' | FileType: ' ++ payload.fileType ++ ' | TotalRecords: ' ++ payload.totalRecords ++ ' | ValidRecords: ' ++ payload.validCount ++ ' | InvalidRecords: ' ++ payload.invalidCount ++ ' | Timestamp: ' ++ (now() as String)]"/>
+                <set-variable value="#[payload.fileName]" doc:name="Store File Name" variableName="currentFileName"/>
+                <set-variable value="#[payload.validRecords]" doc:name="Store Valid Records" variableName="currentValidRecords"/>
+                <set-variable value="#[payload.invalidRecords]" doc:name="Store Invalid Records" variableName="currentInvalidRecords"/>
+                <set-variable value="#[payload.fileType]" doc:name="Store File Type" variableName="currentFileType"/>
+                <set-variable value="#[payload.validCount]" doc:name="Store Valid Count" variableName="currentValidCount"/>
+                <set-variable value="#[payload.invalidCount]" doc:name="Store Invalid Count" variableName="currentInvalidCount"/>
 
-                        <!-- Store file metadata -->
-                        <set-variable value="#[payload.fileName]" doc:name="Store File Name" variableName="currentFileName"/>
-                        <set-variable value="#[payload.validRecords]" doc:name="Store Valid Records" variableName="currentValidRecords"/>
-                        <set-variable value="#[payload.invalidRecords]" doc:name="Store Invalid Records" variableName="currentInvalidRecords"/>
-                        <set-variable value="#[payload.fileType]" doc:name="Store File Type" variableName="currentFileType"/>
-                        <set-variable value="#[payload.validCount]" doc:name="Store Valid Count" variableName="currentValidCount"/>
-                        <set-variable value="#[payload.invalidCount]" doc:name="Store Invalid Count" variableName="currentInvalidCount"/>
+                <logger level="INFO" doc:name="Log File Parsed" 
+                        message="#[output application/java --- '[INFO] [WORKER] File Parsed | FileName: ' ++ vars.currentFileName ++ ' | FileType: ' ++ vars.currentFileType ++ ' | Valid: ' ++ vars.currentValidCount ++ ' | Invalid: ' ++ vars.currentInvalidCount ++ ' | Timestamp: ' ++ (now() as String)]"/>
 
-                        <!-- Check if valid file type -->
-                        <choice doc:name="Check File Type">
-                            <when expression="#[vars.currentFileType == 'UNKNOWN']">
-                                <logger level="ERROR" doc:name="Log Unsupported File Type" 
-                                        message="#[output application/java --- '[ERROR] Unsupported File Type | CorrelationID: ' ++ correlationId ++ ' | FileName: ' ++ vars.currentFileName ++ ' | Timestamp: ' ++ (now() as String)]"/>
-                                <raise-error type="APP:VALIDATION_ERROR" description="#['Unsupported file type: ' ++ vars.currentFileName ++ '. Only CSV and Excel files are supported.']"/>
-                            </when>
-                        </choice>
+                <!-- Check if valid file type -->
+                <choice doc:name="Check File Type">
+                    <when expression="#[vars.currentFileType == 'UNKNOWN']">
+                        <logger level="ERROR" doc:name="Log Unsupported File Type" 
+                                message="#[output application/java --- '[ERROR] [WORKER] Unsupported File Type | FileName: ' ++ vars.currentFileName ++ ' | Timestamp: ' ++ (now() as String)]"/>
+                        <raise-error type="APP:VALIDATION_ERROR" description="#['Unsupported file type: ' ++ vars.currentFileName]"/>
+                    </when>
+                </choice>
 
-                        <!-- Batch Store Invalid Records in DLQ -->
-                        <choice doc:name="Has Invalid Records?">
-                            <when expression="#[vars.currentInvalidCount > 0]">
-                                <set-variable value="#[now()]" doc:name="Set DLQ Start Time" variableName="dlqStartTime"/>
-                                
-                                <logger level="WARN" doc:name="Log DLQ Insert Start" 
-                                        message="#[output application/java --- '[WARN] DLQ Insert Started | CorrelationID: ' ++ correlationId ++ ' | FileName: ' ++ vars.currentFileName ++ ' | InvalidRecordsCount: ' ++ vars.currentInvalidCount ++ ' | StartTime: ' ++ (vars.dlqStartTime as String)]"/>
-                                
-                                <try doc:name="Try Batch Insert DLQ">
-                                    <ee:transform doc:name="Prepare DLQ Batch">
-                                        <ee:message>
-                                            <ee:set-payload><![CDATA[%dw 2.0
+                <!-- Batch Store Invalid Records in DLQ -->
+                <choice doc:name="Has Invalid Records?">
+                    <when expression="#[vars.currentInvalidCount > 0]">
+                        <try doc:name="Try Batch Insert DLQ">
+                            <ee:transform doc:name="Prepare DLQ Batch">
+                                <ee:message>
+                                    <ee:set-payload><![CDATA[%dw 2.0
 output application/json
 ---
 vars.currentInvalidRecords map {
@@ -392,57 +367,47 @@ vars.currentInvalidRecords map {
     error_message: $.errors joinBy ", ",
     file_name: vars.currentFileName
 }]]></ee:set-payload>
-                                        </ee:message>
-                                    </ee:transform>
-                                    
-                                    <until-successful maxRetries="3" millisBetweenRetries="2000" doc:name="Retry DLQ Batch Insert">
-                                        <db:bulk-insert doc:name="Batch Insert to DLQ" config-ref="Database_Config">
-                                            <db:sql><![CDATA[INSERT INTO dead_letter_queue (source_id, name, email, age, error_message, file_name, created_at) 
+                                </ee:message>
+                            </ee:transform>
+                            
+                            <until-successful maxRetries="3" millisBetweenRetries="2000" doc:name="Retry DLQ Batch Insert">
+                                <db:bulk-insert doc:name="Batch Insert to DLQ" config-ref="Database_Config">
+                                    <db:sql><![CDATA[INSERT INTO dead_letter_queue (source_id, name, email, age, error_message, file_name, created_at) 
 VALUES (:source_id, :name, :email, :age, :error_message, :file_name, CURRENT_TIMESTAMP)]]></db:sql>
-                                        </db:bulk-insert>
-                                    </until-successful>
-                                    
-                                    <!-- Calculate DLQ Processing Time -->
-                                    <set-variable value="#[now()]" doc:name="Set DLQ End Time" variableName="dlqEndTime"/>
-                                    
-                                    <logger level="INFO" doc:name="Log DLQ Insert Success" 
-                                            message="#[output application/java --- '[INFO] DLQ Insert Completed | CorrelationID: ' ++ correlationId ++ ' | FileName: ' ++ vars.currentFileName ++ ' | RecordsInserted: ' ++ vars.currentInvalidCount ++ ' | ProcessingTime: ' ++ ((vars.dlqEndTime - vars.dlqStartTime) as Number) ++ 'ms | Timestamp: ' ++ (vars.dlqEndTime as String)]"/>
-                                    
-                                    <error-handler>
-                                        <on-error-continue enableNotifications="true" logException="true">
-                                            <logger level="ERROR" doc:name="Log DLQ Batch Failure" 
-                                                    message="#[output application/java --- '[ERROR] DLQ Insert Failed | CorrelationID: ' ++ correlationId ++ ' | FileName: ' ++ vars.currentFileName ++ ' | RecordsAttempted: ' ++ vars.currentInvalidCount ++ ' | Error: ' ++ (error.description default 'Unknown error') ++ ' | Timestamp: ' ++ (now() as String)]"/>
-                                        </on-error-continue>
-                                    </error-handler>
-                                </try>
-                            </when>
-                        </choice>
+                                </db:bulk-insert>
+                            </until-successful>
+                            
+                            <logger level="INFO" doc:name="Log DLQ Insert Success" 
+                                    message="#[output application/java --- '[INFO] [WORKER] DLQ Insert Completed | FileName: ' ++ vars.currentFileName ++ ' | RecordsInserted: ' ++ vars.currentInvalidCount ++ ' | Timestamp: ' ++ (now() as String)]"/>
+                            
+                            <error-handler>
+                                <on-error-continue enableNotifications="true" logException="true">
+                                    <logger level="ERROR" doc:name="Log DLQ Failure" 
+                                            message="#[output application/java --- '[ERROR] [WORKER] DLQ Insert Failed | FileName: ' ++ vars.currentFileName ++ ' | Error: ' ++ (error.description default 'Unknown') ++ ' | Timestamp: ' ++ (now() as String)]"/>
+                                </on-error-continue>
+                            </error-handler>
+                        </try>
+                    </when>
+                </choice>
 
-                        <!-- Process valid records with batch insert -->
-                        <choice doc:name="Has Valid Records?">
-                            <when expression="#[vars.currentValidCount > 0]">
-                                <set-variable value="#[now()]" doc:name="Set Validation Start Time" variableName="validationStartTime"/>
-                                
-                                <logger level="INFO" doc:name="Log Validation Start" 
-                                        message="#[output application/java --- '[INFO] Validation Started | CorrelationID: ' ++ correlationId ++ ' | FileName: ' ++ vars.currentFileName ++ ' | ValidRecordsCount: ' ++ vars.currentValidCount ++ ' | StartTime: ' ++ (vars.validationStartTime as String)]"/>
-                                
-                                <!-- Check for duplicate emails -->
-                                <ee:transform doc:name="Check Email Duplicates">
-                                    <ee:message>
-                                        <ee:set-payload><![CDATA[%dw 2.0
+                <!-- Process valid records -->
+                <choice doc:name="Has Valid Records?">
+                    <when expression="#[vars.currentValidCount > 0]">
+                        <!-- Check for duplicates -->
+                        <ee:transform doc:name="Check Email Duplicates">
+                            <ee:message>
+                                <ee:set-payload><![CDATA[%dw 2.0
 output application/json
 ---
 do {
     var validRecords = vars.currentValidRecords
     var alreadyProcessedEmails = vars.processedEmails
     
-    // Group records by email to find duplicates within file
     var emailGroups = validRecords groupBy $.email
     var duplicateEmailsInFile = (emailGroups pluck (records, email) -> 
         if (sizeOf(records) > 1) email else null
     ) filter ($ != null)
     
-    // Check against already processed emails from previous files
     var duplicateEmailsAcrossFiles = validRecords 
         filter (alreadyProcessedEmails contains $.email)
         map $.email
@@ -450,7 +415,6 @@ do {
     
     var allDuplicateEmails = (duplicateEmailsInFile ++ duplicateEmailsAcrossFiles) distinctBy $
     
-    // Separate records into insertable and duplicates
     var recordsToInsert = validRecords filter !(allDuplicateEmails contains $.email)
     var duplicateRecords = validRecords filter (allDuplicateEmails contains $.email)
     ---
@@ -460,335 +424,147 @@ do {
         duplicateCount: sizeOf(duplicateRecords)
     }
 }]]></ee:set-payload>
-                                    </ee:message>
-                                </ee:transform>
+                            </ee:message>
+                        </ee:transform>
 
-                                <set-variable value="#[payload.recordsToInsert]" doc:name="Store Insertable Records" variableName="recordsToInsert"/>
-                                <set-variable value="#[payload.duplicateRecords]" doc:name="Store Duplicate Records" variableName="duplicateRecords"/>
-                                <set-variable value="#[payload.duplicateCount]" doc:name="Store Duplicate Count" variableName="duplicateCount"/>
+                        <set-variable value="#[payload.recordsToInsert]" doc:name="Store Insertable Records" variableName="recordsToInsert"/>
+                        <set-variable value="#[payload.duplicateCount]" doc:name="Store Duplicate Count" variableName="duplicateCount"/>
 
-                                <logger level="INFO" doc:name="Log Duplicate Detection" 
-                                        message="#[output application/java --- '[INFO] Duplicate Detection Completed | CorrelationID: ' ++ correlationId ++ ' | FileName: ' ++ vars.currentFileName ++ ' | DuplicatesFound: ' ++ vars.duplicateCount ++ ' | RecordsToInsert: ' ++ sizeOf(vars.recordsToInsert) ++ ' | Timestamp: ' ++ (now() as String)]"/>
-
-                                <!-- Check for existing emails in database using IN clause -->
-                                <choice doc:name="Has Records to Insert?">
-                                    <when expression="#[sizeOf(vars.recordsToInsert) > 0]">
-                                        <set-variable value="#[now()]" doc:name="Set DB Check Start Time" variableName="dbCheckStartTime"/>
-                                        
-                                        <ee:transform doc:name="Build IN Clause">
-                                            <ee:message>
-                                                <ee:set-payload><![CDATA[%dw 2.0
+                        <!-- Check existing emails in database -->
+                        <choice doc:name="Any Records to Insert?">
+                            <when expression="#[sizeOf(vars.recordsToInsert) > 0]">
+                                <ee:transform doc:name="Build Email List">
+                                    <ee:message>
+                                        <ee:set-payload><![CDATA[%dw 2.0
 output application/java
 ---
-{
-    emailList: vars.recordsToInsert map $.email
-}]]></ee:set-payload>
-                                            </ee:message>
-                                        </ee:transform>
-                                        
-                                        <db:select doc:name="Batch Check Emails in DB" config-ref="Database_Config">
-                                            <db:sql><![CDATA[SELECT email FROM records WHERE email IN (:emailList)]]></db:sql>
-                                            <db:input-parameters><![CDATA[#[{
-                                                emailList: payload.emailList
-                                            }]]]></db:input-parameters>
-                                        </db:select>
-                                        
-                                        <set-variable value="#[payload]" doc:name="Store Existing Emails" variableName="existingEmailsInDb"/>
-                                        
-                                        <logger level="INFO" doc:name="Log DB Check Complete" 
-                                                message="#[output application/java --- '[INFO] DB Email Check Completed | CorrelationID: ' ++ correlationId ++ ' | FileName: ' ++ vars.currentFileName ++ ' | ExistingEmailsInDB: ' ++ sizeOf(vars.existingEmailsInDb) ++ ' | ProcessingTime: ' ++ ((now() - vars.dbCheckStartTime) as Number) ++ 'ms | Timestamp: ' ++ (now() as String)]"/>
-                                        
-                                        <!-- Filter out emails that exist in database -->
-                                        <ee:transform doc:name="Filter Non-Duplicate Records">
-                                            <ee:message>
-                                                <ee:set-payload><![CDATA[%dw 2.0
+{ emailList: vars.recordsToInsert map $.email }]]></ee:set-payload>
+                                    </ee:message>
+                                </ee:transform>
+                                
+                                <db:select doc:name="Batch Check Emails in DB" config-ref="Database_Config">
+                                    <db:sql><![CDATA[SELECT email FROM records WHERE email IN (:emailList)]]></db:sql>
+                                    <db:input-parameters><![CDATA[#[{ emailList: payload.emailList }]]]></db:input-parameters>
+                                </db:select>
+                                
+                                <set-variable value="#[payload map $.email]" doc:name="Store Existing Emails" variableName="existingEmailsInDb"/>
+                                
+                                <!-- Filter out DB duplicates -->
+                                <ee:transform doc:name="Filter Non-Duplicate Records">
+                                    <ee:message>
+                                        <ee:set-payload><![CDATA[%dw 2.0
 output application/json
 ---
-do {
-    var existingEmails = vars.existingEmailsInDb map $.email
-    var recordsToInsert = vars.recordsToInsert filter !(existingEmails contains $.email)
-    ---
-    {
-        recordsToInsert: recordsToInsert,
-        existingEmailCount: sizeOf(existingEmails)
-    }
-}]]></ee:set-payload>
-                                            </ee:message>
-                                        </ee:transform>
-                                        
-                                        <set-variable value="#[payload.recordsToInsert]" doc:name="Update Insertable Records" variableName="finalRecordsToInsert"/>
-                                        <set-variable value="#[payload.existingEmailCount]" doc:name="Store Existing Count" variableName="existingEmailCount"/>
-                                        
-                                        <!-- Batch Insert Valid Non-Duplicate Records -->
-                                        <choice doc:name="Has Final Records?">
-                                            <when expression="#[sizeOf(vars.finalRecordsToInsert) > 0]">
-                                                <set-variable value="#[0]" doc:name="Initialize Inserted Count" variableName="insertedCount"/>
-                                                <set-variable value="#[0]" doc:name="Initialize Failed Count" variableName="failedCount"/>
-                                                <set-variable value="#[now()]" doc:name="Set Insert Start Time" variableName="insertStartTime"/>
-                                                
-                                                <logger level="INFO" doc:name="Log Insert Start" 
-                                                        message="#[output application/java --- '[INFO] Batch Insert Started | CorrelationID: ' ++ correlationId ++ ' | FileName: ' ++ vars.currentFileName ++ ' | RecordsToInsert: ' ++ sizeOf(vars.finalRecordsToInsert) ++ ' | StartTime: ' ++ (vars.insertStartTime as String)]"/>
-                                                
-                                                <try doc:name="Try Batch Insert">
-                                                    <ee:transform doc:name="Prepare Batch Insert">
-                                                        <ee:message>
-                                                            <ee:set-payload><![CDATA[%dw 2.0
+vars.recordsToInsert filter !(vars.existingEmailsInDb contains $.email)]]></ee:set-payload>
+                                    </ee:message>
+                                </ee:transform>
+                                
+                                <set-variable value="#[payload]" doc:name="Update Insertable Records" variableName="finalRecordsToInsert"/>
+                                
+                                <!-- Batch Insert -->
+                                <choice doc:name="Final Records Remaining?">
+                                    <when expression="#[sizeOf(vars.finalRecordsToInsert) > 0]">
+                                        <try doc:name="Try Batch Insert">
+                                            <ee:transform doc:name="Prepare Batch Insert">
+                                                <ee:message>
+                                                    <ee:set-payload><![CDATA[%dw 2.0
 output application/json
 ---
 vars.finalRecordsToInsert]]></ee:set-payload>
-                                                        </ee:message>
-                                                    </ee:transform>
-                                                    
-                                                    <until-successful maxRetries="3" millisBetweenRetries="2000" doc:name="Retry Batch Insert">
-                                                        <db:bulk-insert doc:name="Batch Insert Records" config-ref="Database_Config">
-                                                            <db:sql><![CDATA[INSERT INTO records (source_id, name, email, age) 
+                                                </ee:message>
+                                            </ee:transform>
+                                            
+                                            <until-successful maxRetries="3" millisBetweenRetries="2000" doc:name="Retry Batch Insert">
+                                                <db:bulk-insert doc:name="Batch Insert Records" config-ref="Database_Config">
+                                                    <db:sql><![CDATA[INSERT INTO records (source_id, name, email, age) 
 VALUES (:source_id, :name, :email, :age) 
 ON CONFLICT (source_id) DO NOTHING]]></db:sql>
-                                                        </db:bulk-insert>
-                                                    </until-successful>
-                                                    
-                                                    <set-variable value="#[sizeOf(vars.finalRecordsToInsert)]" doc:name="Set Inserted Count" variableName="insertedCount"/>
-                                                    <set-variable value="#[now()]" doc:name="Set Insert End Time" variableName="insertEndTime"/>
-                                                    
-                                                    <logger level="INFO" doc:name="Log Insert Success" 
-                                                            message="#[output application/java --- '[INFO] Batch Insert Completed | CorrelationID: ' ++ correlationId ++ ' | FileName: ' ++ vars.currentFileName ++ ' | RecordsInserted: ' ++ vars.insertedCount ++ ' | ProcessingTime: ' ++ ((vars.insertEndTime - vars.insertStartTime) as Number) ++ 'ms | Timestamp: ' ++ (vars.insertEndTime as String)]"/>
-                                                    
-                                                    <!-- Add emails to processed list -->
-                                                    <ee:transform doc:name="Add to Processed Emails">
-                                                        <ee:message>
-                                                        </ee:message>
-                                                        <ee:variables>
-                                                            <ee:set-variable variableName="processedEmails"><![CDATA[%dw 2.0
+                                                </db:bulk-insert>
+                                            </until-successful>
+                                            
+                                            <set-variable value="#[sizeOf(vars.finalRecordsToInsert)]" doc:name="Set Inserted Count" variableName="insertedCount"/>
+                                            
+                                            <logger level="INFO" doc:name="Log Insert Success" 
+                                                    message="#[output application/java --- '[INFO] [WORKER] Records Inserted | FileName: ' ++ vars.currentFileName ++ ' | Count: ' ++ vars.insertedCount ++ ' | Timestamp: ' ++ (now() as String)]"/>
+                                            
+                                            <!-- Add emails to processed list -->
+                                            <ee:transform doc:name="Add to Processed Emails">
+                                                <ee:message>
+                                                </ee:message>
+                                                <ee:variables>
+                                                    <ee:set-variable variableName="processedEmails"><![CDATA[%dw 2.0
 output application/json
 ---
 vars.processedEmails ++ (vars.finalRecordsToInsert map $.email)]]></ee:set-variable>
-                                                        </ee:variables>
-                                                    </ee:transform>
-                                                    
-                                                    <!-- Error handler for failed batch insert -->
-                                                    <error-handler>
-                                                        <on-error-continue enableNotifications="true" logException="true">
-                                                            <logger level="ERROR" doc:name="Log Batch Insert Failure" 
-                                                                    message="#[output application/java --- '[ERROR] Batch Insert Failed | CorrelationID: ' ++ correlationId ++ ' | FileName: ' ++ vars.currentFileName ++ ' | RecordsAttempted: ' ++ sizeOf(vars.finalRecordsToInsert) ++ ' | Error: ' ++ (error.description default 'Unknown error') ++ ' | ProcessingTime: ' ++ ((now() - vars.insertStartTime) as Number) ++ 'ms | Timestamp: ' ++ (now() as String)]"/>
-                                                            
-                                                            <set-variable value="#[sizeOf(vars.finalRecordsToInsert)]" doc:name="Set Failed Count" variableName="failedCount"/>
-                                                            
-                                                            <!-- Store all failed records in DLQ as batch -->
-                                                            <try doc:name="Try Store Failed Batch in DLQ">
-                                                                <ee:transform doc:name="Prepare Failed Batch for DLQ">
-                                                                    <ee:message>
-                                                                        <ee:set-payload><![CDATA[%dw 2.0
-output application/json
----
-vars.finalRecordsToInsert map {
-    source_id: $.source_id,
-    name: $.name,
-    email: $.email,
-    age: $.age,
-    error_message: "Database batch insert failed: " ++ (error.description default "Unknown error"),
-    file_name: vars.currentFileName
-}]]></ee:set-payload>
-                                                                    </ee:message>
-                                                                </ee:transform>
-                                                                
-                                                                <db:bulk-insert doc:name="Batch Insert Failed to DLQ" config-ref="Database_Config">
-                                                                    <db:sql><![CDATA[INSERT INTO dead_letter_queue (source_id, name, email, age, error_message, file_name, created_at) 
-VALUES (:source_id, :name, :email, :age, :error_message, :file_name, CURRENT_TIMESTAMP)]]></db:sql>
-                                                                </db:bulk-insert>
-                                                                
-                                                                <logger level="INFO" doc:name="Log Failed Records to DLQ" 
-                                                                        message="#[output application/java --- '[INFO] Failed Records Stored in DLQ | CorrelationID: ' ++ correlationId ++ ' | FileName: ' ++ vars.currentFileName ++ ' | FailedRecordsCount: ' ++ vars.failedCount ++ ' | Timestamp: ' ++ (now() as String)]"/>
-                                                                
-                                                                <error-handler>
-                                                                    <on-error-continue enableNotifications="true" logException="true">
-                                                                        <logger level="ERROR" doc:name="Log DLQ Batch Failure" 
-                                                                                message="#[output application/java --- '[ERROR] Failed to Store Failed Records in DLQ | CorrelationID: ' ++ correlationId ++ ' | FileName: ' ++ vars.currentFileName ++ ' | Error: ' ++ (error.description default 'Unknown error') ++ ' | Timestamp: ' ++ (now() as String)]"/>
-                                                                    </on-error-continue>
-                                                                </error-handler>
-                                                            </try>
-                                                        </on-error-continue>
-                                                    </error-handler>
-                                                </try>
-                                            </when>
-                                            <otherwise>
-                                                <set-variable value="#[0]" doc:name="Set Zero Inserted" variableName="insertedCount"/>
-                                                <set-variable value="#[0]" doc:name="Set Zero Failed" variableName="failedCount"/>
-                                                
-                                                <logger level="INFO" doc:name="Log No Records to Insert" 
-                                                        message="#[output application/java --- '[INFO] No Records to Insert | CorrelationID: ' ++ correlationId ++ ' | FileName: ' ++ vars.currentFileName ++ ' | Reason: All records are duplicates | Timestamp: ' ++ (now() as String)]"/>
-                                            </otherwise>
-                                        </choice>
+                                                </ee:variables>
+                                            </ee:transform>
+                                            
+                                            <error-handler>
+                                                <on-error-continue enableNotifications="true" logException="true">
+                                                    <logger level="ERROR" doc:name="Log Insert Failure" 
+                                                            message="#[output application/java --- '[ERROR] [WORKER] Batch Insert Failed | FileName: ' ++ vars.currentFileName ++ ' | Error: ' ++ (error.description default 'Unknown') ++ ' | Timestamp: ' ++ (now() as String)]"/>
+                                                    <set-variable value="#[sizeOf(vars.finalRecordsToInsert)]" doc:name="Set Failed Count" variableName="failedCount"/>
+                                                </on-error-continue>
+                                            </error-handler>
+                                        </try>
                                     </when>
                                     <otherwise>
-                                        <set-variable value="#[0]" doc:name="No Records to Insert" variableName="insertedCount"/>
-                                        <set-variable value="#[0]" doc:name="No Failed Records" variableName="failedCount"/>
-                                        <set-variable value="#[0]" doc:name="No Existing Emails" variableName="existingEmailCount"/>
-                                        
-                                        <logger level="INFO" doc:name="Log All Duplicates" 
-                                                message="#[output application/java --- '[INFO] All Records Are Duplicates | CorrelationID: ' ++ correlationId ++ ' | FileName: ' ++ vars.currentFileName ++ ' | Timestamp: ' ++ (now() as String)]"/>
+                                        <set-variable value="#[0]" doc:name="Set Zero Inserted" variableName="insertedCount"/>
                                     </otherwise>
                                 </choice>
-
-                                <!-- Update totals -->
-                                <ee:transform doc:name="Update Totals">
-                                    <ee:message>
-                                    </ee:message>
-                                    <ee:variables>
-                                        <ee:set-variable variableName="totalRecords"><![CDATA[%dw 2.0
-output application/json
----
-vars.totalRecords + (vars.insertedCount default 0)]]></ee:set-variable>
-                                        <ee:set-variable variableName="totalValid"><![CDATA[%dw 2.0
-output application/json
----
-vars.totalValid + vars.currentValidCount]]></ee:set-variable>
-                                        <ee:set-variable variableName="totalInvalid"><![CDATA[%dw 2.0
-output application/json
----
-vars.totalInvalid + vars.currentInvalidCount]]></ee:set-variable>
-                                        <ee:set-variable variableName="totalFailed"><![CDATA[%dw 2.0
-output application/json
----
-vars.totalFailed + (vars.failedCount default 0)]]></ee:set-variable>
-                                    </ee:variables>
-                                </ee:transform>
                             </when>
+                            <otherwise>
+                                <set-variable value="#[0]" doc:name="No Records to Insert" variableName="insertedCount"/>
+                            </otherwise>
                         </choice>
 
-                        <!-- Calculate File Processing Time -->
-                        <set-variable value="#[now()]" doc:name="Set File End Time" variableName="fileEndTime"/>
-                        <set-variable value="#[(vars.fileEndTime - vars.fileStartTime) as Number]" doc:name="Calculate File Processing Time" variableName="fileProcessingTime"/>
-
-                        <!-- Add file result -->
-                        <ee:transform doc:name="Add File Result">
+                        <!-- Update totals -->
+                        <ee:transform doc:name="Update Totals">
                             <ee:message>
                             </ee:message>
                             <ee:variables>
-                                <ee:set-variable variableName="fileResults"><![CDATA[%dw 2.0
+                                <ee:set-variable variableName="totalRecords"><![CDATA[%dw 2.0
 output application/json
 ---
-vars.fileResults + [{
-    fileName: vars.currentFileName,
-    status: 'SUCCESS',
-    processingTimeMs: vars.fileProcessingTime,
-    totalRecordsInFile: vars.currentValidCount + vars.currentInvalidCount,
-    validRecords: vars.currentValidCount,
-    invalidRecords: vars.currentInvalidCount,
-    duplicateRecords: (vars.duplicateCount default 0) + (vars.existingEmailCount default 0),
-    recordsInserted: vars.insertedCount default 0,
-    recordsFailed: vars.failedCount default 0,
-    invalidDetails: vars.currentInvalidRecords map {
-        row: $$.index + 1,
-        name: $.name,
-        email: $.email,
-        age: $.age,
-        errors: $.errors
-    }
-}]]]></ee:set-variable>
+vars.totalRecords + (vars.insertedCount default 0)]]></ee:set-variable>
+                                <ee:set-variable variableName="totalValid"><![CDATA[%dw 2.0
+output application/json
+---
+vars.totalValid + vars.currentValidCount]]></ee:set-variable>
+                                <ee:set-variable variableName="totalInvalid"><![CDATA[%dw 2.0
+output application/json
+---
+vars.totalInvalid + vars.currentInvalidCount]]></ee:set-variable>
+                                <ee:set-variable variableName="totalFailed"><![CDATA[%dw 2.0
+output application/json
+---
+vars.totalFailed + (vars.failedCount default 0)]]></ee:set-variable>
                             </ee:variables>
                         </ee:transform>
+                    </when>
+                </choice>
 
-                        <!-- Log File Processing Complete -->
-                        <logger level="INFO" doc:name="Log File Processing Complete" 
-                                message="#[output application/java --- '[INFO] File Processing Completed | CorrelationID: ' ++ correlationId ++ ' | FileName: ' ++ vars.currentFileName ++ ' | Status: SUCCESS | TotalRecords: ' ++ (vars.currentValidCount + vars.currentInvalidCount) ++ ' | ValidRecords: ' ++ vars.currentValidCount ++ ' | InvalidRecords: ' ++ vars.currentInvalidCount ++ ' | RecordsInserted: ' ++ (vars.insertedCount default 0) ++ ' | RecordsFailed: ' ++ (vars.failedCount default 0) ++ ' | ProcessingTime: ' ++ vars.fileProcessingTime ++ 'ms | Timestamp: ' ++ (vars.fileEndTime as String)]"/>
+                <logger level="INFO" doc:name="Log File Complete" 
+                        message="#[output application/java --- '[INFO] [WORKER] File Processing Completed | FileName: ' ++ vars.currentFileName ++ ' | RecordsInserted: ' ++ (vars.insertedCount default 0) ++ ' | Timestamp: ' ++ (now() as String)]"/>
 
-                        <!-- Error handler for file processing -->
-                        <error-handler>
-                            <on-error-continue enableNotifications="true" logException="true" type="APP:VALIDATION_ERROR">
-                                <set-variable value="#[now()]" doc:name="Set Error Time" variableName="errorTime"/>
-                                
-                                <logger level="ERROR" doc:name="Log Validation Error" 
-                                        message="#[output application/java --- '[ERROR] File Validation Error | CorrelationID: ' ++ correlationId ++ ' | FileName: ' ++ (vars.currentFileName default 'unknown') ++ ' | Error: ' ++ (error.description default 'Unknown error') ++ ' | Timestamp: ' ++ (vars.errorTime as String)]"/>
-                                
-                                <ee:transform doc:name="Add Validation Error">
-                                    <ee:message>
-                                    </ee:message>
-                                    <ee:variables>
-                                        <ee:set-variable variableName="fileResults"><![CDATA[%dw 2.0
-output application/json
----
-vars.fileResults + [{
-    fileName: (vars.currentFileName default 'unknown'), 
-    status: 'VALIDATION_ERROR',
-    errorCode: 422,
-    message: error.description default "Unknown validation error",
-    timestamp: vars.errorTime
-}]]]></ee:set-variable>
-                                        <ee:set-variable variableName="httpStatus">422</ee:set-variable>
-                                    </ee:variables>
-                                </ee:transform>
-                            </on-error-continue>
-                            
-                            <on-error-continue enableNotifications="true" logException="true">
-                                <set-variable value="#[now()]" doc:name="Set Error Time" variableName="errorTime"/>
-                                
-                                <logger level="ERROR" doc:name="Log Processing Error" 
-                                        message="#[output application/java --- '[ERROR] File Processing Error | CorrelationID: ' ++ correlationId ++ ' | FileName: ' ++ (vars.currentFileName default 'unknown') ++ ' | Error: ' ++ (error.description default 'Unknown error') ++ ' | Timestamp: ' ++ (vars.errorTime as String)]"/>
-                                
-                                <ee:transform doc:name="Add Processing Error">
-                                    <ee:message>
-                                    </ee:message>
-                                    <ee:variables>
-                                        <ee:set-variable variableName="fileResults"><![CDATA[%dw 2.0
-output application/json
----
-vars.fileResults + [{
-    fileName: (vars.currentFileName default 'unknown'), 
-    status: 'ERROR',
-    errorCode: 500,
-                                    message: error.description default "Unknown error",
-                                    timestamp: vars.errorTime
-}]]]></ee:set-variable>
-                                        <ee:set-variable variableName="httpStatus">500</ee:set-variable>
-                                    </ee:variables>
-                                </ee:transform>
-                            </on-error-continue>
-                        </error-handler>
-                    </try>
-                </when>
-                <otherwise>
-                    <logger level="DEBUG" doc:name="Skip Non-File Part" 
-                            message="#[output application/java --- '[DEBUG] Skipping Non-File Part | CorrelationID: ' ++ correlationId ++ ' | PartName: ' ++ payload.partName ++ ' | Timestamp: ' ++ (now() as String)]"/>
-                </otherwise>
-            </choice>
+                <error-handler>
+                    <on-error-continue enableNotifications="true" logException="true">
+                        <logger level="ERROR" doc:name="Log File Error" 
+                                message="#[output application/java --- '[ERROR] [WORKER] File Processing Error | FileName: ' ++ (vars.currentFileName default 'unknown') ++ ' | Error: ' ++ (error.description default 'Unknown') ++ ' | Timestamp: ' ++ (now() as String)]"/>
+                    </on-error-continue>
+                </error-handler>
+            </try>
         </foreach>
 
-        <!-- Calculate Total Processing Time -->
-        <set-variable value="#[now()]" doc:name="Set Request End Time" variableName="requestEndTime"/>
-        <set-variable value="#[(vars.requestEndTime - vars.requestStartTime) as Number]" doc:name="Calculate Total Processing Time" variableName="totalProcessingTime"/>
+        <logger level="INFO" doc:name="Log Worker Complete" 
+                message="#[output application/java --- '[INFO] [WORKER] All Files Processed | CorrelationID: ' ++ correlationId ++ ' | TotalRecordsInserted: ' ++ vars.totalRecords ++ ' | ProcessingTime: ' ++ ((now() - vars.workerStartTime) as Number) ++ 'ms | Timestamp: ' ++ (now() as String)]"/>
 
-        <!-- Build final response -->
-        <ee:transform doc:name="Build Response">
-            <ee:message>
-                <ee:set-payload><![CDATA[%dw 2.0
-output application/json
----
-{
-    status: "COMPLETED",
-    message: "Multiple file upload processed with batch validation and insertion",
-    correlationId: correlationId,
-    summary: {
-        totalFilesProcessed: sizeOf(vars.fileResults),
-        totalRecordsInserted: vars.totalRecords,
-        totalValidRecords: vars.totalValid,
-        totalInvalidRecords: vars.totalInvalid,
-        totalFailedRecords: vars.totalFailed,
-        totalProcessingTimeMs: vars.totalProcessingTime
-    },
-    fileResults: vars.fileResults,
-    timestamp: vars.requestEndTime
-}]]></ee:set-payload>
-            </ee:message>
-        </ee:transform>
-
-        <!-- Log Request Complete -->
-        <logger level="INFO" doc:name="Log Request Complete" 
-                message="#[output application/java --- '[INFO] Request Completed | CorrelationID: ' ++ correlationId ++ ' | Status: COMPLETED | TotalFilesProcessed: ' ++ sizeOf(vars.fileResults) ++ ' | TotalRecordsInserted: ' ++ vars.totalRecords ++ ' | TotalValidRecords: ' ++ vars.totalValid ++ ' | TotalInvalidRecords: ' ++ vars.totalInvalid ++ ' | TotalFailedRecords: ' ++ vars.totalFailed ++ ' | TotalProcessingTime: ' ++ vars.totalProcessingTime ++ 'ms | Timestamp: ' ++ (vars.requestEndTime as String)]"/>
-
-        <!-- Set HTTP Status to 200 for successful completion -->
-        <set-variable value="200" doc:name="Set Status 200" variableName="httpStatus"/>
-
-        <!-- Apply Global Error Handler -->
-        <error-handler ref="Global_Error_Handler"/>
+        <error-handler>
+            <on-error-continue enableNotifications="true" logException="true">
+                <logger level="ERROR" doc:name="Log Worker Error" 
+                        message="#[output application/java --- '[ERROR] [WORKER] Unhandled Error | CorrelationID: ' ++ correlationId ++ ' | Error: ' ++ (error.description default 'Unknown') ++ ' | Timestamp: ' ++ (now() as String)]"/>
+            </on-error-continue>
+        </error-handler>
     </flow>
+
 </mule>
