@@ -566,5 +566,108 @@ vars.totalFailed + (vars.failedCount default 0)]]></ee:set-variable>
             </on-error-continue>
         </error-handler>
     </flow>
+    
+    <!-- Upload Status Check Flow -->
+<flow name="upload-status-flow" doc:name="Upload Status Flow">
+    <http:listener doc:name="Listener" config-ref="HTTP_Listener_config" path="/upload-status" allowedMethods="GET">
+        <http:response statusCode="#[vars.httpStatus default 200]">
+            <http:headers><![CDATA[#[{'Content-Type': 'application/json'}]]]></http:headers>
+        </http:response>
+        <http:error-response statusCode="#[vars.httpStatus default 500]">
+            <http:headers><![CDATA[#[{'Content-Type': 'application/json'}]]]></http:headers>
+        </http:error-response>
+    </http:listener>
+
+    <logger level="INFO" doc:name="Log Status Request" 
+            message="#[output application/java --- '[INFO] Status Request | CorrelationID: ' ++ (attributes.queryParams.correlationId default 'none') ++ ' | Timestamp: ' ++ (now() as String)]"/>
+
+    <!-- Validate correlation ID -->
+    <choice doc:name="Has CorrelationId?">
+        <when expression="#[attributes.queryParams.correlationId == null or attributes.queryParams.correlationId == '']">
+            <ee:transform doc:name="400 Missing CorrelationId">
+                <ee:message>
+                    <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+    status: "BAD_REQUEST",
+    errorCode: 400,
+    message: "correlationId query parameter is required",
+    timestamp: now()
+}]]></ee:set-payload>
+                </ee:message>
+                <ee:variables>
+                    <ee:set-variable variableName="httpStatus">400</ee:set-variable>
+                </ee:variables>
+            </ee:transform>
+        </when>
+        <otherwise>
+            <set-variable value="#[attributes.queryParams.correlationId]" doc:name="Store CorrelationId" variableName="requestedCorrelationId"/>
+            
+            <!-- Query processing status from database -->
+            <try doc:name="Try Query Status">
+                <!-- Get records count -->
+                <db:select doc:name="Get Records Count" config-ref="Database_Config">
+                    <db:sql><![CDATA[SELECT COUNT(*) as total_records FROM records]]></db:sql>
+                </db:select>
+                
+                <set-variable value="#[payload[0].total_records]" doc:name="Store Records Count" variableName="totalRecords"/>
+                
+                <!-- Get DLQ count -->
+                <db:select doc:name="Get DLQ Count" config-ref="Database_Config">
+                    <db:sql><![CDATA[SELECT COUNT(*) as total_invalid FROM dead_letter_queue]]></db:sql>
+                </db:select>
+                
+                <set-variable value="#[payload[0].total_invalid]" doc:name="Store DLQ Count" variableName="totalInvalid"/>
+                
+                <!-- Build response -->
+                <ee:transform doc:name="Build Status Response">
+                    <ee:message>
+                        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+    status: "SUCCESS",
+    correlationId: vars.requestedCorrelationId,
+    message: "Status information retrieved",
+    data: {
+        totalRecordsProcessed: vars.totalRecords,
+        totalInvalidRecords: vars.totalInvalid,
+        note: "This is aggregate data. For request-specific tracking, consider adding a processing_status table."
+    },
+    timestamp: now()
+}]]></ee:set-payload>
+                    </ee:message>
+                </ee:transform>
+                
+                <error-handler>
+                    <on-error-propagate enableNotifications="true" logException="true">
+                        <logger level="ERROR" doc:name="Log Query Error" 
+                                message="#[output application/java --- '[ERROR] Status Query Failed | CorrelationID: ' ++ vars.requestedCorrelationId ++ ' | Error: ' ++ (error.description default 'Unknown') ++ ' | Timestamp: ' ++ (now() as String)]"/>
+                        <ee:transform doc:name="500 Error Response">
+                            <ee:message>
+                                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+    status: "ERROR",
+    errorCode: 500,
+    message: "Failed to retrieve status information",
+    correlationId: vars.requestedCorrelationId,
+    timestamp: now()
+}]]></ee:set-payload>
+                            </ee:message>
+                            <ee:variables>
+                                <ee:set-variable variableName="httpStatus">500</ee:set-variable>
+                            </ee:variables>
+                        </ee:transform>
+                    </on-error-propagate>
+                </error-handler>
+            </try>
+        </otherwise>
+    </choice>
+
+    <error-handler ref="Global_Error_Handler"/>
+</flow>
 
 </mule>
