@@ -1,0 +1,3 @@
+# THIS FILE IS NOT USED
+# Production configuration is in config-prod.yaml
+# All values are loaded from config-prod.yaml for CloudHub deployment
