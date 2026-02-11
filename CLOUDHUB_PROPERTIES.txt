@@ -1,0 +1,74 @@
+# ===================================================================
+# CLOUDHUB DEPLOYMENT - PRODUCTION READY
+# ===================================================================
+
+# Your RDS Database: database-1.c3qei6o6u3a5.eu-north-1.rds.amazonaws.com
+# Region: EU North (Stockholm)
+
+# ===================================================================
+# STEP 1: Connect to RDS and Setup Database
+# ===================================================================
+# Use a PostgreSQL client (pgAdmin, DBeaver, or psql) to connect:
+# Host: database-1.c3qei6o6u3a5.eu-north-1.rds.amazonaws.com
+# Port: 5432
+# Database: postgres (initially, then create employee_management)
+# Username: postgres
+# Password: nuwantha123@
+# SSL: Required
+
+# Run the database-setup.sql script to create the employees table
+
+# ===================================================================
+# STEP 2: Deploy from Anypoint Studio to CloudHub
+# ===================================================================
+# In Anypoint Studio:
+# 1. Right-click project → Run As → Run Configurations
+# 2. Select "Mule Application (CloudHub 2.0)" or "CloudHub"
+# 3. Click "New Configuration"
+
+# ===================================================================
+# STEP 3: Configure CloudHub Deployment Settings
+# ===================================================================
+# General Tab:
+#   - Application Name: employee-upload-api-prod
+#   - Environment: Production (or your environment)
+#   - Region: EU Central (eu-central-1) or nearest to Stockholm
+#   - Mule Version: 4.10.1
+#   - Worker Size: 0.1 vCores (or larger for production)
+#   - Workers: 1
+
+# ===================================================================
+# STEP 4: Add Properties in CloudHub (Properties Tab)
+# ===================================================================
+# Add ONLY this property (all others are in config-prod.yaml):
+
+mule.env=prod
+
+# That's it! All other settings (database, API, credentials) are 
+# already configured in config-prod.yaml
+
+# ===================================================================
+# OPTIONAL: Override Properties (if needed)
+# ===================================================================
+# Only add these if you need to change from config-prod.yaml defaults:
+
+# db.password=YOUR_DIFFERENT_PASSWORD
+# db.user=YOUR_DIFFERENT_USER
+# api.id=YOUR_DIFFERENT_API_ID
+
+# ===================================================================
+# STEP 5: Deploy and Monitor
+# ===================================================================
+# Click "Deploy Application"
+# Monitor deployment in Runtime Manager
+# Check logs for successful database connection
+# Test API endpoint: https://employee-upload-api-prod.us-e1.cloudhub.io/api/...
+
+# ===================================================================
+# SECURITY BEST PRACTICE (For Real Production)
+# ===================================================================
+# Store sensitive data in CloudHub Secure Properties:
+# 1. In CloudHub Properties, prefix with "secure::" for encryption
+# 2. Example: secure::db.password=nuwantha123@
+# 3. Update config-prod.yaml to use ${secure::db.password}
+

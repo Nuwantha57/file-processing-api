@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<mule xmlns:db="http://www.mulesoft.org/schema/mule/db"
+<mule xmlns:api-gateway="http://www.mulesoft.org/schema/mule/api-gateway"
+      xmlns:db="http://www.mulesoft.org/schema/mule/db"
       xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
       xmlns:http="http://www.mulesoft.org/schema/mule/http"
       xmlns="http://www.mulesoft.org/schema/mule/core"
@@ -9,30 +10,38 @@
         http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
         http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
         http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
-        http://www.mulesoft.org/schema/mule/db http://www.mulesoft.org/schema/mule/db/current/mule-db.xsd">
+        http://www.mulesoft.org/schema/mule/db http://www.mulesoft.org/schema/mule/db/current/mule-db.xsd
+        http://www.mulesoft.org/schema/mule/api-gateway http://www.mulesoft.org/schema/mule/api-gateway/current/mule-api-gateway.xsd">
+
+    <!-- Configuration Properties - Production Only -->
+    <configuration-properties file="config-prod.yaml" doc:name="Configuration properties"/>
+
+    <!-- API Autodiscovery Configuration - DISABLED (API 20729520 is blocked)
+    <api-gateway:autodiscovery 
+        apiId="${api.id}" 
+        ignoreBasePath="true" 
+        doc:name="API Autodiscovery" 
+        flowRef="upload-files-async-flow"/>
+    -->
 
     <!-- HTTP Listener Configuration -->
     <http:listener-config name="HTTP_Listener_config" doc:name="HTTP Listener config">
-        <http:listener-connection host="0.0.0.0" port="8081"/>
+        <http:listener-connection host="0.0.0.0" port="${http.port}"/>
     </http:listener-config>
 
-    <!-- Database Configuration -->
+    <!-- Database Configuration - PostgreSQL -->
     <db:config name="Database_Config" doc:name="Database Config">
-        <db:generic-connection url="jdbc:postgresql://localhost:5432/employee_management?connectTimeout=30&amp;socketTimeout=30"
-                               driverClassName="org.postgresql.Driver"
-                               user="postgres"
-                               password="nuwantha123@"
-                               transactionIsolation="READ_COMMITTED">
+        <db:generic-connection url="jdbc:postgresql://${db.host}:${db.port}/${db.name}?ssl=true&amp;sslmode=require&amp;connectTimeout=30&amp;socketTimeout=30" driverClassName="org.postgresql.Driver" user="${db.user}" password="${db.password}">
             <reconnection>
                 <reconnect frequency="5000" count="3"/>
             </reconnection>
-            <db:pooling-profile maxPoolSize="10" minPoolSize="2" acquireIncrement="1" 
-                               preparedStatementCacheSize="10" maxWait="30000"/>
+            <db:pooling-profile maxPoolSize="10" minPoolSize="2"/>
         </db:generic-connection>
     </db:config>
 
-    <!-- Global Error Handler Configuration -->
-    <error-handler name="Global_Error_Handler" doc:name="Global Error Handler">
+    <!-- Global Error Handler - Your existing implementation -->
+    
+	<error-handler name="Global_Error_Handler" doc:name="Global Error Handler">
         <on-error-propagate type="MULE:EXPRESSION" enableNotifications="true" logException="true">
             <logger level="ERROR" doc:name="Log Bad Request" 
                     message="#[output application/java --- '[ERROR] Bad Request | CorrelationID: ' ++ correlationId ++ ' | Error: ' ++ (error.description default 'Unknown error') ++ ' | Timestamp: ' ++ (now() as String)]"/>
@@ -127,7 +136,7 @@ output application/json
         </on-error-propagate>
     </error-handler>
 
-    <!-- Main Async Upload Flow -->
+    <!-- Main Async Upload Flow - With full implementation from original -->
     <flow name="upload-files-async-flow" doc:name="Upload Files Async Flow">
         <http:listener doc:name="Listener" config-ref="HTTP_Listener_config" path="/upload-files" allowedMethods="POST">
             <http:response statusCode="#[vars.httpStatus default 202]">
@@ -143,14 +152,12 @@ output application/json
         <logger level="INFO" doc:name="Log Request Received" 
                 message="#[output application/java --- '[INFO] Request Received | CorrelationID: ' ++ correlationId ++ ' | Endpoint: /upload-files | Timestamp: ' ++ (vars.requestStartTime as String)]"/>
 
-        <!-- Validate Request has files -->
         <choice doc:name="Has Multipart Data?">
             <when expression="#[payload == null]">
                 <raise-error type="APP:VALIDATION_ERROR" description="No files provided in request"/>
             </when>
         </choice>
 
-        <!-- Extract all files from multipart -->
         <ee:transform doc:name="Extract Files">
             <ee:message>
                 <ee:set-payload><![CDATA[%dw 2.0
@@ -166,7 +173,6 @@ payload.parts pluck (value, key) -> {
             </ee:message>
         </ee:transform>
 
-        <!-- Filter to actual files -->
         <ee:transform doc:name="Filter Files">
             <ee:message>
                 <ee:set-payload><![CDATA[%dw 2.0
@@ -176,7 +182,6 @@ payload filter ($.fileName != "")]]></ee:set-payload>
             </ee:message>
         </ee:transform>
 
-        <!-- Validate at least one file exists -->
         <choice doc:name="Has Files?">
             <when expression="#[sizeOf(payload) == 0]">
                 <raise-error type="APP:VALIDATION_ERROR" description="No valid files found in request. Please upload CSV or Excel files."/>
@@ -189,12 +194,10 @@ payload filter ($.fileName != "")]]></ee:set-payload>
         <logger level="INFO" doc:name="Log Files Detected" 
                 message="#[output application/java --- '[INFO] Files Detected | CorrelationID: ' ++ correlationId ++ ' | FileCount: ' ++ vars.fileCount ++ ' | Timestamp: ' ++ (now() as String)]"/>
 
-        <!-- Process files asynchronously -->
         <async doc:name="Async Processing">
-            <flow-ref name="process-files-worker-flow" doc:name="Process Files"/>
+            <flow-ref name="process-files-worker-flow" doc:name="process-files-worker-flow"/>
         </async>
 
-        <!-- Immediate 202 response -->
         <ee:transform doc:name="Build 202 Response">
             <ee:message>
                 <ee:set-payload><![CDATA[%dw 2.0
@@ -298,7 +301,7 @@ do {
         var allErrors = nameError ++ emailMandatoryError ++ emailFormatError ++ ageError
         ---
         {
-            source_id: recordId,
+            id: recordId,
             name: recordName,
             email: recordEmail,
             age: recordAge,
@@ -360,7 +363,7 @@ do {
 output application/json
 ---
 vars.currentInvalidRecords map {
-    source_id: $.source_id,
+    id: $.id,
     name: $.name,
     email: $.email,
     age: $.age,
@@ -372,8 +375,8 @@ vars.currentInvalidRecords map {
                             
                             <until-successful maxRetries="3" millisBetweenRetries="2000" doc:name="Retry DLQ Batch Insert">
                                 <db:bulk-insert doc:name="Batch Insert to DLQ" config-ref="Database_Config">
-                                    <db:sql><![CDATA[INSERT INTO dead_letter_queue (source_id, name, email, age, error_message, file_name, created_at) 
-VALUES (:source_id, :name, :email, :age, :error_message, :file_name, CURRENT_TIMESTAMP)]]></db:sql>
+                                    <db:sql><![CDATA[INSERT INTO dead_letter_queue (id, name, email, age, error_message, file_name, created_at) 
+VALUES (:id, :name, :email, :age, :error_message, :file_name, CURRENT_TIMESTAMP)]]></db:sql>
                                 </db:bulk-insert>
                             </until-successful>
                             
@@ -438,13 +441,15 @@ do {
                                         <ee:set-payload><![CDATA[%dw 2.0
 output application/java
 ---
-{ emailList: vars.recordsToInsert map $.email }]]></ee:set-payload>
+{ 
+  emailList: vars.recordsToInsert map $.email,
+  emailsForQuery: "'" ++ (vars.recordsToInsert map $.email joinBy "','") ++ "'"
+}]]></ee:set-payload>
                                     </ee:message>
                                 </ee:transform>
                                 
                                 <db:select doc:name="Batch Check Emails in DB" config-ref="Database_Config">
-                                    <db:sql><![CDATA[SELECT email FROM records WHERE email IN (:emailList)]]></db:sql>
-                                    <db:input-parameters><![CDATA[#[{ emailList: payload.emailList }]]]></db:input-parameters>
+                                    <db:sql><![CDATA[#["SELECT email FROM employees WHERE email IN (" ++ payload.emailsForQuery ++ ")"]]]></db:sql>
                                 </db:select>
                                 
                                 <set-variable value="#[payload map $.email]" doc:name="Store Existing Emails" variableName="existingEmailsInDb"/>
@@ -476,9 +481,9 @@ vars.finalRecordsToInsert]]></ee:set-payload>
                                             
                                             <until-successful maxRetries="3" millisBetweenRetries="2000" doc:name="Retry Batch Insert">
                                                 <db:bulk-insert doc:name="Batch Insert Records" config-ref="Database_Config">
-                                                    <db:sql><![CDATA[INSERT INTO records (source_id, name, email, age) 
-VALUES (:source_id, :name, :email, :age) 
-ON CONFLICT (source_id) DO NOTHING]]></db:sql>
+                                                    <db:sql><![CDATA[INSERT INTO employees (id, name, email, age) 
+VALUES (:id, :name, :email, :age) 
+ON CONFLICT (id) DO NOTHING]]></db:sql>
                                                 </db:bulk-insert>
                                             </until-successful>
                                             
@@ -608,7 +613,7 @@ output application/json
             <try doc:name="Try Query Status">
                 <!-- Get records count -->
                 <db:select doc:name="Get Records Count" config-ref="Database_Config">
-                    <db:sql><![CDATA[SELECT COUNT(*) as total_records FROM records]]></db:sql>
+                    <db:sql><![CDATA[SELECT COUNT(*) as total_records FROM employees]]></db:sql>
                 </db:select>
                 
                 <set-variable value="#[payload[0].total_records]" doc:name="Store Records Count" variableName="totalRecords"/>

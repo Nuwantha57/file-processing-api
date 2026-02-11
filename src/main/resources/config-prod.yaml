@@ -1,0 +1,21 @@
+# Configuration Properties File
+# Environment: Production (CloudHub)
+
+# HTTP Configuration
+http.port: "8081"
+
+# Database Configuration - AWS RDS PostgreSQL
+db.host: "database-1.c3qei6o6u3a5.eu-north-1.rds.amazonaws.com"
+db.port: "5432"
+db.name: "employee_management"
+db.user: "postgres"
+# db.password is set as secure property in CloudHub
+
+# API Autodiscovery
+api.id: "20729520"
+api.name: "employee-upload-api"
+api.version: "v1"
+
+# Anypoint Platform
+anypoint.platform.client_id: "206882f585664dee911e793cd38a2914"
+# anypoint.platform.client_secret is set as secure property in CloudHub

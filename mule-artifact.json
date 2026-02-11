@@ -2,5 +2,25 @@
   "minMuleVersion": "4.10.0",
   "javaSpecificationVersions": [
     "17"
-  ]
+  ],
+  "secureProperties": [],
+  "configs": [
+    "file-processing-api.xml"
+  ],
+  "redeploymentEnabled": true,
+  "name": "file-processing-rds-api",
+  "requiredProduct": "MULE_EE",
+  "classLoaderModelLoaderDescriptor": {
+    "id": "mule",
+    "attributes": {
+      "exportedPackages": [
+        "org.postgresql"
+      ],
+      "exportedResources": []
+    }
+  },
+  "bundleDescriptorLoader": {
+    "id": "mule",
+    "attributes": {}
+  }
 }
