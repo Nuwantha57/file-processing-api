@@ -51,8 +51,14 @@ CREATE TABLE dead_letter_queue (
 
 ## API Endpoints
 
+🔒 **Authentication Required**: All endpoints require Client ID & Secret authentication headers.
+
 ### 1. Upload CSV Files
 **POST** `/upload-files`
+
+**Authentication Headers** (Required):
+- `client_id`: `file-processing-api-client-2026`
+- `client_secret`: Your secret key (set in CloudHub secure properties)
 
 **Request**:
 - **Content-Type**: `multipart/form-data`
@@ -65,18 +71,28 @@ id,name,email,age
 2,Jane Smith,jane.smith@example.com,25
 ```
 
-**Response**:
+**Response (Success - 202 Accepted)**:
 ```json
 {
-  "status": "Accepted",
-  "message": "Files queued for processing. Use correlation ID to check status.",
+  "status": "ACCEPTED",
+  "message": "Files queued for asynchronous processing",
   "correlationId": "34052b6d-30f7-4d94-8933-0279a084a2c5",
-  "filesReceived": 2,
+  "filesQueued": 2,
   "timestamp": "2026-02-11T03:29:08Z"
 }
 ```
 
-**Status Code**: `202 Accepted`
+**Response (Authentication Failed - 401 Unauthorized)**:
+```json
+{
+  "status": "UNAUTHORIZED",
+  "errorCode": 401,
+  "message": "Authentication failed. Invalid or missing client credentials.",
+  "error": "Valid client_id and client_secret headers are required",
+  "correlationId": "xyz-789",
+  "timestamp": "2026-02-11T10:31:00Z"
+}
+```
 
 ### 2. Check Upload Status
 **GET** `/upload-status?correlationId={correlationId}`
@@ -134,18 +150,26 @@ GET /upload-status?correlationId=1401263a-1819-4c09-b6fa-2cd8a277d803
    https://file-processing-rds-api-vfup2v.5sc6y6-2.usa-e2.cloudhub.io/upload-files
    ```
 
-2. Set **Body** → **form-data**:
+2. Set **Headers**:
+   | Key | Value |
+   |-----|-------|
+   | `client_id` | `file-processing-api-client-2026` |
+   | `client_secret` | `your-secret-key-here` |
+
+3. Set **Body** → **form-data**:
    - Key: `file` (change type to File)
    - Value: Select your CSV file
 
-3. Click **Send**
+4. Click **Send**
 
-4. Expected Response (202):
+5. Expected Response (202):
    ```json
    {
-     "status": "Accepted",
+     "status": "ACCEPTED",
+     "message": "Files queued for asynchronous processing",
      "correlationId": "abc-123-xyz",
-     "filesReceived": 1
+     "filesQueued": 1,
+     "timestamp": "2026-02-11T10:30:00Z"
    }
    ```
 
@@ -319,6 +343,7 @@ file-processing-api/
 ```
 
 ## Key Features
+✅ **Client ID & Secret Authentication** - API secured with header-based credentials  
 ✅ Asynchronous CSV file processing  
 ✅ Data validation with detailed error messages  
 ✅ Duplicate detection (file-level and database-level)  
@@ -327,6 +352,21 @@ file-processing-api/
 ✅ PostgreSQL array parameter handling  
 ✅ Correlation ID for request tracking  
 ✅ Status endpoint for monitoring  
+✅ CloudHub secure properties for sensitive data  
+
+## Security Notes
+🔒 **Production Ready**: The API is secured with Client ID & Secret authentication  
+🔒 **Secure Storage**: All secrets stored as encrypted CloudHub properties  
+🔒 **Access Control**: Only authorized clients with valid credentials can access endpoints  
+🔒 **Audit Logging**: All authentication attempts logged with IP addresses  
+
+See [SECURITY.md](SECURITY.md) for complete security configuration guide.
+
+## Important Notes
+- Application uses **config-prod.yaml** in production (CloudHub)
+- Sensitive credentials stored as **CloudHub secure properties** (encrypted)
+- API requires authentication headers for all requests
+- Processing is **asynchronous** (202 response)  
 
 ## Performance
 - **Batch Size**: Processes records in batches for efficiency

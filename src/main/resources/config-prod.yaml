@@ -19,3 +19,7 @@ api.version: "v1"
 # Anypoint Platform
 anypoint.platform.client_id: "206882f585664dee911e793cd38a2914"
 # anypoint.platform.client_secret is set as secure property in CloudHub
+
+# API Authentication - Client Credentials
+api.client_id: "file-processing-api-client-2026"
+# api.client_secret is set as secure property in CloudHub (Recommended: Use a strong random key)

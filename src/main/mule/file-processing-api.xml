@@ -42,6 +42,29 @@
     <!-- Global Error Handler - Your existing implementation -->
     
 	<error-handler name="Global_Error_Handler" doc:name="Global Error Handler">
+        <on-error-propagate type="APP:AUTHENTICATION_ERROR" enableNotifications="true" logException="true">
+            <logger level="WARN" doc:name="Log Authentication Error" 
+                    message="#[output application/java --- '[WARN] Authentication Failed | CorrelationID: ' ++ correlationId ++ ' | IP: ' ++ (attributes.headers['x-forwarded-for'] default attributes.remoteAddress) ++ ' | Timestamp: ' ++ (now() as String)]"/>
+            <ee:transform doc:name="401 Unauthorized Response">
+                <ee:message>
+                    <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+    status: "UNAUTHORIZED",
+    errorCode: 401,
+    message: "Authentication failed. Invalid or missing client credentials.",
+    error: "Valid client_id and client_secret headers are required",
+    correlationId: correlationId,
+    timestamp: now()
+}]]></ee:set-payload>
+                </ee:message>
+                <ee:variables>
+                    <ee:set-variable variableName="httpStatus">401</ee:set-variable>
+                </ee:variables>
+            </ee:transform>
+        </on-error-propagate>
+
         <on-error-propagate type="MULE:EXPRESSION" enableNotifications="true" logException="true">
             <logger level="ERROR" doc:name="Log Bad Request" 
                     message="#[output application/java --- '[ERROR] Bad Request | CorrelationID: ' ++ correlationId ++ ' | Error: ' ++ (error.description default 'Unknown error') ++ ' | Timestamp: ' ++ (now() as String)]"/>
@@ -146,6 +169,25 @@ output application/json
                 <http:headers><![CDATA[#[{'Content-Type': 'application/json'}]]]></http:headers>
             </http:error-response>
         </http:listener>
+
+        <!-- Authentication Validation -->
+        <set-variable value="#[attributes.headers.client_id default '']" doc:name="Extract Client ID" variableName="requestClientId"/>
+        <set-variable value="#[attributes.headers.client_secret default '']" doc:name="Extract Client Secret" variableName="requestClientSecret"/>
+        
+        <logger level="INFO" doc:name="Log Authentication Attempt" 
+                message="#[output application/java --- '[INFO] Authentication Attempt | CorrelationID: ' ++ correlationId ++ ' | ClientID: ' ++ (if (vars.requestClientId != '') vars.requestClientId else 'MISSING') ++ ' | IP: ' ++ (attributes.headers['x-forwarded-for'] default attributes.remoteAddress) ++ ' | Timestamp: ' ++ (now() as String)]"/>
+        
+        <choice doc:name="Validate Credentials">
+            <when expression="#[vars.requestClientId == '' or vars.requestClientSecret == '']">
+                <raise-error type="APP:AUTHENTICATION_ERROR" description="Missing authentication credentials. Both client_id and client_secret headers are required."/>
+            </when>
+            <when expression="#[vars.requestClientId != p('api.client_id') or vars.requestClientSecret != p('api.client_secret')]">
+                <raise-error type="APP:AUTHENTICATION_ERROR" description="Invalid authentication credentials. The provided client_id or client_secret is incorrect."/>
+            </when>
+        </choice>
+        
+        <logger level="INFO" doc:name="Log Authentication Success" 
+                message="#[output application/java --- '[INFO] Authentication Success | CorrelationID: ' ++ correlationId ++ ' | ClientID: ' ++ vars.requestClientId ++ ' | Timestamp: ' ++ (now() as String)]"/>
 
         <set-variable value="#[now()]" doc:name="Set Request Start Time" variableName="requestStartTime"/>
         
