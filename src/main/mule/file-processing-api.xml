@@ -13,7 +13,6 @@
         http://www.mulesoft.org/schema/mule/db http://www.mulesoft.org/schema/mule/db/current/mule-db.xsd
         http://www.mulesoft.org/schema/mule/api-gateway http://www.mulesoft.org/schema/mule/api-gateway/current/mule-api-gateway.xsd">
 
-
     <!-- Configuration Properties - Production Only -->
     <configuration-properties file="config-prod.yaml" doc:name="Configuration properties"/>
 
@@ -25,21 +24,13 @@
         flowRef="upload-files-async-flow"/>
     -->
 
-    <!-- ================================================================
-         FIX: HTTP Listener Configuration
-         - Added connectionIdleTimeout: 60000ms so the socket stays open
-           long enough for large multipart uploads to complete.
-         - Added sendTcpNoDelay: true to flush small packets immediately.
-         - Added clientTimeout: 60000ms to tolerate slow clients.
-         These three together prevent "Connection reset" (SocketException)
-         caused by the client or an intermediate proxy dropping the socket
-         before Netty finishes reading the multipart body.
-    ================================================================ -->
+    <!-- HTTP Listener Configuration
+         connectionIdleTimeout: keeps socket open 60s for large multipart uploads.
+         The "Connection reset" SocketException in logs is CloudHub load balancer
+         noise — it does NOT affect your flows. Suppress it via log4j2.xml.
+    -->
     <http:listener-config name="HTTP_Listener_config" doc:name="HTTP Listener config">
-        <http:listener-connection
-            host="0.0.0.0"
-            port="${http.port}"
-            connectionIdleTimeout="60000"/>
+        <http:listener-connection host="0.0.0.0" port="${http.port}" connectionIdleTimeout="60000"/>
     </http:listener-config>
 
     <!-- Database Configuration - PostgreSQL -->
@@ -168,20 +159,7 @@ output application/json
             </ee:transform>
         </on-error-propagate>
 
-        <!-- ================================================================
-             FIX: Handle MULE:CONNECTIVITY (connection reset from client)
-             - Added MULE:CONNECTIVITY as a top-level error type so that
-               a "Connection reset" SocketException from Netty is caught
-               gracefully and logged as a WARN rather than crashing the flow.
-             - on-error-continue means the flow does NOT re-throw; it logs
-               and moves on, preventing unnecessary 500 responses.
-        ================================================================ -->
-        <on-error-continue type="MULE:CONNECTIVITY" enableNotifications="false" logException="false">
-            <logger level="WARN" doc:name="Log Client Disconnect"
-                    message="#[output application/java --- '[WARN] Client disconnected before request was fully read (Connection reset). CorrelationID: ' ++ correlationId ++ ' | IP: ' ++ (attributes.headers['x-forwarded-for'] default (attributes.remoteAddress default 'unknown')) ++ ' | Timestamp: ' ++ (now() as String)]"/>
-        </on-error-continue>
-
-        <on-error-propagate type="DB:CONNECTIVITY, DB:QUERY_EXECUTION" enableNotifications="true" logException="true">
+        <on-error-propagate type="DB:CONNECTIVITY, DB:QUERY_EXECUTION, MULE:CONNECTIVITY" enableNotifications="true" logException="true">
             <logger level="ERROR" doc:name="Log DB/System Error"
                     message="#[output application/java --- '[ERROR] System Error | CorrelationID: ' ++ correlationId ++ ' | Error: ' ++ (error.description default 'Unknown error') ++ ' | Timestamp: ' ++ (now() as String)]"/>
             <ee:transform doc:name="500 DB Error Response">
@@ -241,12 +219,6 @@ output application/json
          Inserts status=ACCEPTED into processing_status before hand-off.
          ============================================================ -->
     <flow name="upload-files-async-flow" doc:name="Upload Files Async Flow">
-        <!-- ================================================================
-             FIX: HTTP Listener
-             - Removed outputMimeType override so Mule auto-detects multipart.
-             - The listener-connection timeout settings above handle the socket
-               level; here nothing else needs to change at the listener tag.
-        ================================================================ -->
         <http:listener doc:name="Listener" config-ref="HTTP_Listener_config" path="/upload-files" allowedMethods="POST">
             <http:response statusCode="#[vars.httpStatus default 202]">
                 <http:headers><![CDATA[#[{'Content-Type': 'application/json'}]]]></http:headers>
@@ -256,59 +228,49 @@ output application/json
             </http:error-response>
         </http:listener>
 
-        <!-- ================================================================
-             FIX: Wrap entire flow body in a try block that catches
-             MULE:CONNECTIVITY (Connection reset / SocketException).
-             This means even if Netty fires the SocketException mid-flow
-             (e.g. during multipart parsing), we catch it gracefully here
-             and log a WARN instead of letting it propagate as an unhandled
-             500 error.
-        ================================================================ -->
-        <try doc:name="Guard Against Client Disconnect">
+        <!-- ── Authentication ───────────────────────────────────── -->
+        <set-variable value="#[attributes.headers.client_id default '']"
+                      doc:name="Extract Client ID"
+                      variableName="requestClientId"/>
+        <set-variable value="#[attributes.headers.client_secret default '']"
+                      doc:name="Extract Client Secret"
+                      variableName="requestClientSecret"/>
 
-            <!-- ── Authentication ───────────────────────────────────── -->
-            <set-variable value="#[attributes.headers.client_id default '']"
-                          doc:name="Extract Client ID"
-                          variableName="requestClientId"/>
-            <set-variable value="#[attributes.headers.client_secret default '']"
-                          doc:name="Extract Client Secret"
-                          variableName="requestClientSecret"/>
+        <logger level="INFO" doc:name="Log Authentication Attempt"
+                message="#[output application/java --- '[INFO] Authentication Attempt | CorrelationID: ' ++ correlationId ++ ' | ClientID: ' ++ (if (vars.requestClientId != '') vars.requestClientId else 'MISSING') ++ ' | IP: ' ++ (attributes.headers['x-forwarded-for'] default attributes.remoteAddress) ++ ' | Timestamp: ' ++ (now() as String)]"/>
 
-            <logger level="INFO" doc:name="Log Authentication Attempt"
-                    message="#[output application/java --- '[INFO] Authentication Attempt | CorrelationID: ' ++ correlationId ++ ' | ClientID: ' ++ (if (vars.requestClientId != '') vars.requestClientId else 'MISSING') ++ ' | IP: ' ++ (attributes.headers['x-forwarded-for'] default attributes.remoteAddress) ++ ' | Timestamp: ' ++ (now() as String)]"/>
+        <choice doc:name="Validate Credentials">
+            <when expression="#[vars.requestClientId == '' or vars.requestClientSecret == '']">
+                <raise-error type="APP:AUTHENTICATION_ERROR"
+                             description="Missing authentication credentials. Both client_id and client_secret headers are required."/>
+            </when>
+            <when expression="#[vars.requestClientId != p('api.client_id') or vars.requestClientSecret != p('api.client_secret')]">
+                <raise-error type="APP:AUTHENTICATION_ERROR"
+                             description="Invalid authentication credentials. The provided client_id or client_secret is incorrect."/>
+            </when>
+        </choice>
 
-            <choice doc:name="Validate Credentials">
-                <when expression="#[vars.requestClientId == '' or vars.requestClientSecret == '']">
-                    <raise-error type="APP:AUTHENTICATION_ERROR"
-                                 description="Missing authentication credentials. Both client_id and client_secret headers are required."/>
-                </when>
-                <when expression="#[vars.requestClientId != p('api.client_id') or vars.requestClientSecret != p('api.client_secret')]">
-                    <raise-error type="APP:AUTHENTICATION_ERROR"
-                                 description="Invalid authentication credentials. The provided client_id or client_secret is incorrect."/>
-                </when>
-            </choice>
+        <logger level="INFO" doc:name="Log Authentication Success"
+                message="#[output application/java --- '[INFO] Authentication Success | CorrelationID: ' ++ correlationId ++ ' | ClientID: ' ++ vars.requestClientId ++ ' | Timestamp: ' ++ (now() as String)]"/>
 
-            <logger level="INFO" doc:name="Log Authentication Success"
-                    message="#[output application/java --- '[INFO] Authentication Success | CorrelationID: ' ++ correlationId ++ ' | ClientID: ' ++ vars.requestClientId ++ ' | Timestamp: ' ++ (now() as String)]"/>
+        <!-- ── Request bookkeeping ──────────────────────────────── -->
+        <set-variable value="#[now()]"         doc:name="Set Request Start Time" variableName="requestStartTime"/>
+        <set-variable value="#[correlationId]" doc:name="Store Correlation ID"   variableName="requestCorrelationId"/>
 
-            <!-- ── Request bookkeeping ──────────────────────────────── -->
-            <set-variable value="#[now()]"         doc:name="Set Request Start Time" variableName="requestStartTime"/>
-            <set-variable value="#[correlationId]" doc:name="Store Correlation ID"   variableName="requestCorrelationId"/>
+        <logger level="INFO" doc:name="Log Request Received"
+                message="#[output application/java --- '[INFO] Request Received | CorrelationID: ' ++ correlationId ++ ' | Endpoint: /upload-files | Timestamp: ' ++ (vars.requestStartTime as String)]"/>
 
-            <logger level="INFO" doc:name="Log Request Received"
-                    message="#[output application/java --- '[INFO] Request Received | CorrelationID: ' ++ correlationId ++ ' | Endpoint: /upload-files | Timestamp: ' ++ (vars.requestStartTime as String)]"/>
+        <!-- ── Payload guard ────────────────────────────────────── -->
+        <choice doc:name="Has Multipart Data?">
+            <when expression="#[payload == null]">
+                <raise-error type="APP:VALIDATION_ERROR" description="No files provided in request."/>
+            </when>
+        </choice>
 
-            <!-- ── Payload guard ────────────────────────────────────── -->
-            <choice doc:name="Has Multipart Data?">
-                <when expression="#[payload == null]">
-                    <raise-error type="APP:VALIDATION_ERROR" description="No files provided in request."/>
-                </when>
-            </choice>
-
-            <!-- ── Extract & filter files ───────────────────────────── -->
-            <ee:transform doc:name="Extract Files">
-                <ee:message>
-                    <ee:set-payload><![CDATA[%dw 2.0
+        <!-- ── Extract & filter files ───────────────────────────── -->
+        <ee:transform doc:name="Extract Files">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
 output application/java
 ---
 if ((attributes.headers.'content-type' default "" as String) contains "multipart")
@@ -320,68 +282,66 @@ if ((attributes.headers.'content-type' default "" as String) contains "multipart
     }
 else
     (payload.files default payload) as Array]]></ee:set-payload>
-                </ee:message>
-            </ee:transform>
+            </ee:message>
+        </ee:transform>
 
-            <ee:transform doc:name="Filter Files">
-                <ee:message>
-                    <ee:set-payload><![CDATA[%dw 2.0
+        <ee:transform doc:name="Filter Files">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
 output application/java
 ---
 payload filter ($.fileName != "")]]></ee:set-payload>
-                </ee:message>
-            </ee:transform>
+            </ee:message>
+        </ee:transform>
 
-            <choice doc:name="Has Files?">
-                <when expression="#[sizeOf(payload) == 0]">
-                    <raise-error type="APP:VALIDATION_ERROR"
-                                 description="No valid files found in request. Please upload CSV or Excel files."/>
-                </when>
-            </choice>
+        <choice doc:name="Has Files?">
+            <when expression="#[sizeOf(payload) == 0]">
+                <raise-error type="APP:VALIDATION_ERROR"
+                             description="No valid files found in request. Please upload CSV or Excel files."/>
+            </when>
+        </choice>
 
-            <set-variable value="#[sizeOf(payload)]" doc:name="Store File Count" variableName="fileCount"/>
+        <set-variable value="#[sizeOf(payload)]" doc:name="Store File Count" variableName="fileCount"/>
 
-            <logger level="INFO" doc:name="Log Files Detected"
-                    message="#[output application/java --- '[INFO] Files Detected | CorrelationID: ' ++ correlationId ++ ' | FileCount: ' ++ vars.fileCount ++ ' | Timestamp: ' ++ (now() as String)]"/>
+        <logger level="INFO" doc:name="Log Files Detected"
+                message="#[output application/java --- '[INFO] Files Detected | CorrelationID: ' ++ correlationId ++ ' | FileCount: ' ++ vars.fileCount ++ ' | Timestamp: ' ++ (now() as String)]"/>
 
-            <!-- ──────────────────────────────────────────────────────────
-                 INSERT ACCEPTED into processing_status
-                 ────────────────────────────────────────────────────────── -->
-            <try doc:name="Try Insert ACCEPTED Status">
-                <db:insert doc:name="Insert ACCEPTED Status" config-ref="Database_Config">
-                    <db:sql><![CDATA[INSERT INTO processing_status
+        <!-- ── INSERT ACCEPTED into processing_status ────────────── -->
+        <try doc:name="Try Insert ACCEPTED Status">
+            <db:insert doc:name="Insert ACCEPTED Status" config-ref="Database_Config">
+                <db:sql><![CDATA[INSERT INTO processing_status
     (correlation_id, total_files, total_valid, total_invalid,
      total_inserted, status)
 VALUES
     (:correlationId, :totalFiles, 0, 0,
      0, 'ACCEPTED')
 ON CONFLICT (correlation_id) DO NOTHING]]></db:sql>
-                    <db:input-parameters><![CDATA[#[{
+                <db:input-parameters><![CDATA[#[{
     correlationId: vars.requestCorrelationId,
     totalFiles:    vars.fileCount
 }]]]></db:input-parameters>
-                </db:insert>
+            </db:insert>
 
-                <logger level="INFO" doc:name="Log Status ACCEPTED Inserted"
-                        message="#[output application/java --- '[INFO] Status ACCEPTED inserted | CorrelationID: ' ++ vars.requestCorrelationId ++ ' | TotalFiles: ' ++ vars.fileCount ++ ' | Timestamp: ' ++ (now() as String)]"/>
+            <logger level="INFO" doc:name="Log Status ACCEPTED Inserted"
+                    message="#[output application/java --- '[INFO] Status ACCEPTED inserted | CorrelationID: ' ++ vars.requestCorrelationId ++ ' | TotalFiles: ' ++ vars.fileCount ++ ' | Timestamp: ' ++ (now() as String)]"/>
 
-                <error-handler>
-                    <on-error-continue enableNotifications="true" logException="true">
-                        <logger level="ERROR" doc:name="Log Status Insert Failure"
-                                message="#[output application/java --- '[ERROR] Could not insert ACCEPTED status | CorrelationID: ' ++ vars.requestCorrelationId ++ ' | Error: ' ++ (error.description default 'Unknown') ++ ' | Timestamp: ' ++ (now() as String)]"/>
-                    </on-error-continue>
-                </error-handler>
-            </try>
+            <error-handler>
+                <on-error-continue enableNotifications="true" logException="true">
+                    <logger level="ERROR" doc:name="Log Status Insert Failure"
+                            message="#[output application/java --- '[ERROR] Could not insert ACCEPTED status | CorrelationID: ' ++ vars.requestCorrelationId ++ ' | Error: ' ++ (error.description default 'Unknown') ++ ' | Timestamp: ' ++ (now() as String)]"/>
+                </on-error-continue>
+            </error-handler>
+        </try>
 
-            <!-- ── Hand off to worker asynchronously ────────────────── -->
-            <async doc:name="Async Processing">
-                <flow-ref name="process-files-worker-flow" doc:name="process-files-worker-flow"/>
-            </async>
+        <!-- ── Hand off to worker asynchronously ────────────────── -->
+        <async doc:name="Async Processing">
+            <flow-ref name="process-files-worker-flow" doc:name="process-files-worker-flow"/>
+        </async>
 
-            <!-- ── Return 202 immediately ────────────────────────────── -->
-            <ee:transform doc:name="Build 202 Response">
-                <ee:message>
-                    <ee:set-payload><![CDATA[%dw 2.0
+        <!-- ── Return 202 immediately ────────────────────────────── -->
+        <ee:transform doc:name="Build 202 Response">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
 output application/json
 ---
 {
@@ -396,28 +356,13 @@ output application/json
         statusUrl:        "/upload-status?correlationId=" ++ vars.requestCorrelationId
     }
 }]]></ee:set-payload>
-                </ee:message>
-            </ee:transform>
+            </ee:message>
+        </ee:transform>
 
-            <set-variable value="202" doc:name="Set Status 202" variableName="httpStatus"/>
+        <set-variable value="202" doc:name="Set Status 202" variableName="httpStatus"/>
 
-            <logger level="INFO" doc:name="Log Response Sent"
-                    message="#[output application/java --- '[INFO] 202 Response Sent | CorrelationID: ' ++ vars.requestCorrelationId ++ ' | Timestamp: ' ++ (now() as String)]"/>
-
-            <!-- ================================================================
-                 FIX: Inner error handler for the try block wrapping the flow body.
-                 Catches MULE:CONNECTIVITY (SocketException / Connection reset)
-                 with on-error-continue so the flow ends cleanly without a 500.
-                 All other errors are re-propagated to the flow's Global_Error_Handler.
-            ================================================================ -->
-            <error-handler>
-                <on-error-continue type="MULE:CONNECTIVITY" enableNotifications="false" logException="false">
-                    <logger level="WARN" doc:name="Log Early Client Disconnect"
-                            message="#[output application/java --- '[WARN] Client disconnected during upload (Connection reset). CorrelationID: ' ++ (vars.requestCorrelationId default correlationId) ++ ' | Timestamp: ' ++ (now() as String)]"/>
-                </on-error-continue>
-            </error-handler>
-
-        </try>
+        <logger level="INFO" doc:name="Log Response Sent"
+                message="#[output application/java --- '[INFO] 202 Response Sent | CorrelationID: ' ++ vars.requestCorrelationId ++ ' | Timestamp: ' ++ (now() as String)]"/>
 
         <error-handler ref="Global_Error_Handler"/>
     </flow>
@@ -470,16 +415,15 @@ output application/json
 
             <logger level="INFO" doc:name="Log File Processing Start"
                     message="#[output application/java --- '[INFO] [WORKER] File Processing Started | CorrelationID: ' ++ correlationId ++ ' | FileName: ' ++ (payload.fileName default 'unknown') ++ ' | Timestamp: ' ++ (now() as String)]"/>
-            
+
             <logger level="DEBUG" doc:name="Log Raw Payload"
                     message="#['RAW PAYLOAD: ' ++ (payload as String)]"/>
 
             <try doc:name="Try Process File">
 
-                <!-- ── Parse & validate ───────────────────────────── -->
                 <logger level="DEBUG" doc:name="Log Payload Before Parse"
                         message="#[output application/java --- 'PAYLOAD: ' ++ (payload as String)]"/>
-                
+
                 <ee:transform doc:name="Parse and Validate File">
                     <ee:message>
                         <ee:set-payload><![CDATA[%dw 2.0
@@ -570,7 +514,6 @@ do {
                 <logger level="INFO" doc:name="Log File Parsed"
                         message="#[output application/java --- '[INFO] [WORKER] File Parsed | FileName: ' ++ (vars.currentFileName default 'unknown') ++ ' | FileType: ' ++ (vars.currentFileType default 'unknown') ++ ' | Valid: ' ++ (vars.currentValidCount default 0) ++ ' | Invalid: ' ++ (vars.currentInvalidCount default 0) ++ ' | Timestamp: ' ++ (now() as String)]"/>
 
-                <!-- Guard: Only reject if we have no records at all -->
                 <choice doc:name="Check Has Records">
                     <when expression="#[vars.currentValidCount == 0 and vars.currentInvalidCount == 0]">
                         <logger level="WARN" doc:name="Log No Records"
@@ -884,7 +827,6 @@ WHERE  correlation_id = :correlationId]]></db:sql>
 
         <choice doc:name="Has CorrelationId?">
             <when expression="#[attributes.queryParams.correlationId == null or attributes.queryParams.correlationId == '']">
-                <!-- Missing param — emit envelope directly (no correlationId to reflect back) -->
                 <ee:transform doc:name="400 Missing CorrelationId">
                     <ee:message>
                         <ee:set-payload><![CDATA[%dw 2.0
