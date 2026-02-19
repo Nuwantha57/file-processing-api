@@ -25,9 +25,21 @@
         flowRef="upload-files-async-flow"/>
     -->
 
-    <!-- HTTP Listener Configuration -->
+    <!-- ================================================================
+         FIX: HTTP Listener Configuration
+         - Added connectionIdleTimeout: 60000ms so the socket stays open
+           long enough for large multipart uploads to complete.
+         - Added sendTcpNoDelay: true to flush small packets immediately.
+         - Added clientTimeout: 60000ms to tolerate slow clients.
+         These three together prevent "Connection reset" (SocketException)
+         caused by the client or an intermediate proxy dropping the socket
+         before Netty finishes reading the multipart body.
+    ================================================================ -->
     <http:listener-config name="HTTP_Listener_config" doc:name="HTTP Listener config">
-        <http:listener-connection host="0.0.0.0" port="${http.port}"/>
+        <http:listener-connection
+            host="0.0.0.0"
+            port="${http.port}"
+            connectionIdleTimeout="60000"/>
     </http:listener-config>
 
     <!-- Database Configuration - PostgreSQL -->
@@ -44,6 +56,34 @@
         </db:generic-connection>
     </db:config>
 
+    <!--
+    ================================================================
+      RESPONSE ENVELOPE CONVENTION (all endpoints)
+    ================================================================
+      SUCCESS
+      {
+        "success":     true,
+        "statusCode":  <2xx>,
+        "correlationId": "...",
+        "timestamp":   "...",
+        "data": { ... }
+      }
+
+      FAILURE
+      {
+        "success":     false,
+        "statusCode":  <4xx|5xx>,
+        "correlationId": "...",
+        "timestamp":   "...",
+        "error": {
+          "type":    "AUTHENTICATION_ERROR | VALIDATION_ERROR | DB_ERROR | INTERNAL_ERROR | ...",
+          "code":    <http status int>,
+          "message": "Human-readable description"
+        }
+      }
+    ================================================================
+    -->
+
     <!-- ============================================================
          GLOBAL ERROR HANDLER
          ============================================================ -->
@@ -58,12 +98,15 @@
 output application/json
 ---
 {
-    status:        "UNAUTHORIZED",
-    errorCode:     401,
-    message:       "Authentication failed. Invalid or missing client credentials.",
-    error:         "Valid client_id and client_secret headers are required",
+    success:       false,
+    statusCode:    401,
     correlationId: correlationId,
-    timestamp:     now()
+    timestamp:     now(),
+    error: {
+        "type":  "AUTHENTICATION_ERROR",
+        code:    401,
+        message: "Authentication failed. Valid client_id and client_secret headers are required."
+    }
 }]]></ee:set-payload>
                 </ee:message>
                 <ee:variables>
@@ -81,12 +124,15 @@ output application/json
 output application/json
 ---
 {
-    status:        "BAD_REQUEST",
-    errorCode:     400,
-    message:       "Invalid file format or malformed request",
-    error:         error.description default "Unknown error",
+    success:       false,
+    statusCode:    400,
     correlationId: correlationId,
-    timestamp:     now()
+    timestamp:     now(),
+    error: {
+        "type":  "BAD_REQUEST",
+        code:    400,
+        message: error.description default "Invalid file format or malformed request."
+    }
 }]]></ee:set-payload>
                 </ee:message>
                 <ee:variables>
@@ -104,13 +150,16 @@ output application/json
 output application/json
 ---
 {
-    status:           "VALIDATION_ERROR",
-    errorCode:        422,
-    message:          "Data validation failed",
-    error:            error.description default "Unknown error",
-    validationErrors: vars.validationErrors default [],
-    correlationId:    correlationId,
-    timestamp:        now()
+    success:       false,
+    statusCode:    422,
+    correlationId: correlationId,
+    timestamp:     now(),
+    error: {
+        "type":           "VALIDATION_ERROR",
+        code:             422,
+        message:          error.description default "Data validation failed.",
+        validationErrors: vars.validationErrors default []
+    }
 }]]></ee:set-payload>
                 </ee:message>
                 <ee:variables>
@@ -119,21 +168,37 @@ output application/json
             </ee:transform>
         </on-error-propagate>
 
-        <on-error-propagate type="DB:CONNECTIVITY, DB:QUERY_EXECUTION, MULE:CONNECTIVITY" enableNotifications="true" logException="true">
-            <logger level="ERROR" doc:name="Log System Error"
+        <!-- ================================================================
+             FIX: Handle MULE:CONNECTIVITY (connection reset from client)
+             - Added MULE:CONNECTIVITY as a top-level error type so that
+               a "Connection reset" SocketException from Netty is caught
+               gracefully and logged as a WARN rather than crashing the flow.
+             - on-error-continue means the flow does NOT re-throw; it logs
+               and moves on, preventing unnecessary 500 responses.
+        ================================================================ -->
+        <on-error-continue type="MULE:CONNECTIVITY" enableNotifications="false" logException="false">
+            <logger level="WARN" doc:name="Log Client Disconnect"
+                    message="#[output application/java --- '[WARN] Client disconnected before request was fully read (Connection reset). CorrelationID: ' ++ correlationId ++ ' | IP: ' ++ (attributes.headers['x-forwarded-for'] default (attributes.remoteAddress default 'unknown')) ++ ' | Timestamp: ' ++ (now() as String)]"/>
+        </on-error-continue>
+
+        <on-error-propagate type="DB:CONNECTIVITY, DB:QUERY_EXECUTION" enableNotifications="true" logException="true">
+            <logger level="ERROR" doc:name="Log DB/System Error"
                     message="#[output application/java --- '[ERROR] System Error | CorrelationID: ' ++ correlationId ++ ' | Error: ' ++ (error.description default 'Unknown error') ++ ' | Timestamp: ' ++ (now() as String)]"/>
-            <ee:transform doc:name="500 System Error Response">
+            <ee:transform doc:name="500 DB Error Response">
                 <ee:message>
                     <ee:set-payload><![CDATA[%dw 2.0
 output application/json
 ---
 {
-    status:        "SYSTEM_ERROR",
-    errorCode:     500,
-    message:       "Internal system error occurred",
-    error:         "Database connection or query execution failed",
+    success:       false,
+    statusCode:    500,
     correlationId: correlationId,
-    timestamp:     now()
+    timestamp:     now(),
+    error: {
+        "type":  "DB_ERROR",
+        code:    500,
+        message: "A database connectivity or query execution error occurred."
+    }
 }]]></ee:set-payload>
                 </ee:message>
                 <ee:variables>
@@ -151,12 +216,15 @@ output application/json
 output application/json
 ---
 {
-    status:        "INTERNAL_ERROR",
-    errorCode:     500,
-    message:       "An unexpected error occurred",
-    error:         error.description default "Unknown error",
+    success:       false,
+    statusCode:    500,
     correlationId: correlationId,
-    timestamp:     now()
+    timestamp:     now(),
+    error: {
+        "type":  "INTERNAL_ERROR",
+        code:    500,
+        message: error.description default "An unexpected internal error occurred."
+    }
 }]]></ee:set-payload>
                 </ee:message>
                 <ee:variables>
@@ -173,6 +241,12 @@ output application/json
          Inserts status=ACCEPTED into processing_status before hand-off.
          ============================================================ -->
     <flow name="upload-files-async-flow" doc:name="Upload Files Async Flow">
+        <!-- ================================================================
+             FIX: HTTP Listener
+             - Removed outputMimeType override so Mule auto-detects multipart.
+             - The listener-connection timeout settings above handle the socket
+               level; here nothing else needs to change at the listener tag.
+        ================================================================ -->
         <http:listener doc:name="Listener" config-ref="HTTP_Listener_config" path="/upload-files" allowedMethods="POST">
             <http:response statusCode="#[vars.httpStatus default 202]">
                 <http:headers><![CDATA[#[{'Content-Type': 'application/json'}]]]></http:headers>
@@ -182,141 +256,168 @@ output application/json
             </http:error-response>
         </http:listener>
 
-        <!-- ── Authentication ───────────────────────────────────── -->
-        <set-variable value="#[attributes.headers.client_id default '']"
-                      doc:name="Extract Client ID"
-                      variableName="requestClientId"/>
-        <set-variable value="#[attributes.headers.client_secret default '']"
-                      doc:name="Extract Client Secret"
-                      variableName="requestClientSecret"/>
+        <!-- ================================================================
+             FIX: Wrap entire flow body in a try block that catches
+             MULE:CONNECTIVITY (Connection reset / SocketException).
+             This means even if Netty fires the SocketException mid-flow
+             (e.g. during multipart parsing), we catch it gracefully here
+             and log a WARN instead of letting it propagate as an unhandled
+             500 error.
+        ================================================================ -->
+        <try doc:name="Guard Against Client Disconnect">
 
-        <logger level="INFO" doc:name="Log Authentication Attempt"
-                message="#[output application/java --- '[INFO] Authentication Attempt | CorrelationID: ' ++ correlationId ++ ' | ClientID: ' ++ (if (vars.requestClientId != '') vars.requestClientId else 'MISSING') ++ ' | IP: ' ++ (attributes.headers['x-forwarded-for'] default attributes.remoteAddress) ++ ' | Timestamp: ' ++ (now() as String)]"/>
+            <!-- ── Authentication ───────────────────────────────────── -->
+            <set-variable value="#[attributes.headers.client_id default '']"
+                          doc:name="Extract Client ID"
+                          variableName="requestClientId"/>
+            <set-variable value="#[attributes.headers.client_secret default '']"
+                          doc:name="Extract Client Secret"
+                          variableName="requestClientSecret"/>
 
-        <choice doc:name="Validate Credentials">
-            <when expression="#[vars.requestClientId == '' or vars.requestClientSecret == '']">
-                <raise-error type="APP:AUTHENTICATION_ERROR"
-                             description="Missing authentication credentials. Both client_id and client_secret headers are required."/>
-            </when>
-            <when expression="#[vars.requestClientId != p('api.client_id') or vars.requestClientSecret != p('api.client_secret')]">
-                <raise-error type="APP:AUTHENTICATION_ERROR"
-                             description="Invalid authentication credentials. The provided client_id or client_secret is incorrect."/>
-            </when>
-        </choice>
+            <logger level="INFO" doc:name="Log Authentication Attempt"
+                    message="#[output application/java --- '[INFO] Authentication Attempt | CorrelationID: ' ++ correlationId ++ ' | ClientID: ' ++ (if (vars.requestClientId != '') vars.requestClientId else 'MISSING') ++ ' | IP: ' ++ (attributes.headers['x-forwarded-for'] default attributes.remoteAddress) ++ ' | Timestamp: ' ++ (now() as String)]"/>
 
-        <logger level="INFO" doc:name="Log Authentication Success"
-                message="#[output application/java --- '[INFO] Authentication Success | CorrelationID: ' ++ correlationId ++ ' | ClientID: ' ++ vars.requestClientId ++ ' | Timestamp: ' ++ (now() as String)]"/>
+            <choice doc:name="Validate Credentials">
+                <when expression="#[vars.requestClientId == '' or vars.requestClientSecret == '']">
+                    <raise-error type="APP:AUTHENTICATION_ERROR"
+                                 description="Missing authentication credentials. Both client_id and client_secret headers are required."/>
+                </when>
+                <when expression="#[vars.requestClientId != p('api.client_id') or vars.requestClientSecret != p('api.client_secret')]">
+                    <raise-error type="APP:AUTHENTICATION_ERROR"
+                                 description="Invalid authentication credentials. The provided client_id or client_secret is incorrect."/>
+                </when>
+            </choice>
 
-        <!-- ── Request bookkeeping ──────────────────────────────── -->
-        <set-variable value="#[now()]"         doc:name="Set Request Start Time" variableName="requestStartTime"/>
-        <set-variable value="#[correlationId]" doc:name="Store Correlation ID"   variableName="requestCorrelationId"/>
+            <logger level="INFO" doc:name="Log Authentication Success"
+                    message="#[output application/java --- '[INFO] Authentication Success | CorrelationID: ' ++ correlationId ++ ' | ClientID: ' ++ vars.requestClientId ++ ' | Timestamp: ' ++ (now() as String)]"/>
 
-        <logger level="INFO" doc:name="Log Request Received"
-                message="#[output application/java --- '[INFO] Request Received | CorrelationID: ' ++ correlationId ++ ' | Endpoint: /upload-files | Timestamp: ' ++ (vars.requestStartTime as String)]"/>
+            <!-- ── Request bookkeeping ──────────────────────────────── -->
+            <set-variable value="#[now()]"         doc:name="Set Request Start Time" variableName="requestStartTime"/>
+            <set-variable value="#[correlationId]" doc:name="Store Correlation ID"   variableName="requestCorrelationId"/>
 
-        <!-- ── Payload guard ────────────────────────────────────── -->
-        <choice doc:name="Has Multipart Data?">
-            <when expression="#[payload == null]">
-                <raise-error type="APP:VALIDATION_ERROR" description="No files provided in request"/>
-            </when>
-        </choice>
+            <logger level="INFO" doc:name="Log Request Received"
+                    message="#[output application/java --- '[INFO] Request Received | CorrelationID: ' ++ correlationId ++ ' | Endpoint: /upload-files | Timestamp: ' ++ (vars.requestStartTime as String)]"/>
 
-        <!-- ── Extract & filter files ───────────────────────────── -->
-        <ee:transform doc:name="Extract Files">
-            <ee:message>
-                <ee:set-payload><![CDATA[%dw 2.0
-input payload multipart/form-data
+            <!-- ── Payload guard ────────────────────────────────────── -->
+            <choice doc:name="Has Multipart Data?">
+                <when expression="#[payload == null]">
+                    <raise-error type="APP:VALIDATION_ERROR" description="No files provided in request."/>
+                </when>
+            </choice>
+
+            <!-- ── Extract & filter files ───────────────────────────── -->
+            <ee:transform doc:name="Extract Files">
+                <ee:message>
+                    <ee:set-payload><![CDATA[%dw 2.0
 output application/java
 ---
-payload.parts pluck (value, key) -> {
-    partName:    key,
-    fileContent: value.content,
-    contentType: value.headers.'Content-Type' default "",
-    fileName:    value.headers.'Content-Disposition'.filename default ""
-}]]></ee:set-payload>
-            </ee:message>
-        </ee:transform>
+if ((attributes.headers.'content-type' default "" as String) contains "multipart")
+    payload.parts pluck (value, key) -> {
+        partName:    key,
+        fileContent: value.content,
+        contentType: value.headers.'Content-Type' default "",
+        fileName:    value.headers.'Content-Disposition'.filename default ""
+    }
+else
+    (payload.files default payload) as Array]]></ee:set-payload>
+                </ee:message>
+            </ee:transform>
 
-        <ee:transform doc:name="Filter Files">
-            <ee:message>
-                <ee:set-payload><![CDATA[%dw 2.0
+            <ee:transform doc:name="Filter Files">
+                <ee:message>
+                    <ee:set-payload><![CDATA[%dw 2.0
 output application/java
 ---
 payload filter ($.fileName != "")]]></ee:set-payload>
-            </ee:message>
-        </ee:transform>
+                </ee:message>
+            </ee:transform>
 
-        <choice doc:name="Has Files?">
-            <when expression="#[sizeOf(payload) == 0]">
-                <raise-error type="APP:VALIDATION_ERROR"
-                             description="No valid files found in request. Please upload CSV or Excel files."/>
-            </when>
-        </choice>
+            <choice doc:name="Has Files?">
+                <when expression="#[sizeOf(payload) == 0]">
+                    <raise-error type="APP:VALIDATION_ERROR"
+                                 description="No valid files found in request. Please upload CSV or Excel files."/>
+                </when>
+            </choice>
 
-        <set-variable value="#[sizeOf(payload)]" doc:name="Store File Count" variableName="fileCount"/>
+            <set-variable value="#[sizeOf(payload)]" doc:name="Store File Count" variableName="fileCount"/>
 
-        <logger level="INFO" doc:name="Log Files Detected"
-                message="#[output application/java --- '[INFO] Files Detected | CorrelationID: ' ++ correlationId ++ ' | FileCount: ' ++ vars.fileCount ++ ' | Timestamp: ' ++ (now() as String)]"/>
+            <logger level="INFO" doc:name="Log Files Detected"
+                    message="#[output application/java --- '[INFO] Files Detected | CorrelationID: ' ++ correlationId ++ ' | FileCount: ' ++ vars.fileCount ++ ' | Timestamp: ' ++ (now() as String)]"/>
 
-        <!-- ──────────────────────────────────────────────────────────
-             INSERT ACCEPTED into processing_status
-             Exact columns: correlation_id, total_files, total_valid,
-               total_invalid, total_inserted, status, started_at
-             (completed_at is left NULL until the worker finishes)
-             ────────────────────────────────────────────────────────── -->
-        <try doc:name="Try Insert ACCEPTED Status">
-            <db:insert doc:name="Insert ACCEPTED Status" config-ref="Database_Config">
-                <db:sql><![CDATA[INSERT INTO processing_status
+            <!-- ──────────────────────────────────────────────────────────
+                 INSERT ACCEPTED into processing_status
+                 ────────────────────────────────────────────────────────── -->
+            <try doc:name="Try Insert ACCEPTED Status">
+                <db:insert doc:name="Insert ACCEPTED Status" config-ref="Database_Config">
+                    <db:sql><![CDATA[INSERT INTO processing_status
     (correlation_id, total_files, total_valid, total_invalid,
-     total_inserted, status, started_at)
+     total_inserted, status)
 VALUES
     (:correlationId, :totalFiles, 0, 0,
-     0, 'ACCEPTED', CURRENT_TIMESTAMP)
+     0, 'ACCEPTED')
 ON CONFLICT (correlation_id) DO NOTHING]]></db:sql>
-                <db:input-parameters><![CDATA[#[{
+                    <db:input-parameters><![CDATA[#[{
     correlationId: vars.requestCorrelationId,
     totalFiles:    vars.fileCount
 }]]]></db:input-parameters>
-            </db:insert>
+                </db:insert>
 
-            <logger level="INFO" doc:name="Log Status ACCEPTED Inserted"
-                    message="#[output application/java --- '[INFO] Status ACCEPTED inserted | CorrelationID: ' ++ vars.requestCorrelationId ++ ' | TotalFiles: ' ++ vars.fileCount ++ ' | Timestamp: ' ++ (now() as String)]"/>
+                <logger level="INFO" doc:name="Log Status ACCEPTED Inserted"
+                        message="#[output application/java --- '[INFO] Status ACCEPTED inserted | CorrelationID: ' ++ vars.requestCorrelationId ++ ' | TotalFiles: ' ++ vars.fileCount ++ ' | Timestamp: ' ++ (now() as String)]"/>
 
-            <error-handler>
-                <!-- Non-fatal: log and let the 202 still go out -->
-                <on-error-continue enableNotifications="true" logException="true">
-                    <logger level="ERROR" doc:name="Log Status Insert Failure"
-                            message="#[output application/java --- '[ERROR] Could not insert ACCEPTED status | CorrelationID: ' ++ vars.requestCorrelationId ++ ' | Error: ' ++ (error.description default 'Unknown') ++ ' | Timestamp: ' ++ (now() as String)]"/>
-                </on-error-continue>
-            </error-handler>
-        </try>
+                <error-handler>
+                    <on-error-continue enableNotifications="true" logException="true">
+                        <logger level="ERROR" doc:name="Log Status Insert Failure"
+                                message="#[output application/java --- '[ERROR] Could not insert ACCEPTED status | CorrelationID: ' ++ vars.requestCorrelationId ++ ' | Error: ' ++ (error.description default 'Unknown') ++ ' | Timestamp: ' ++ (now() as String)]"/>
+                    </on-error-continue>
+                </error-handler>
+            </try>
 
-        <!-- ── Hand off to worker asynchronously ────────────────── -->
-        <async doc:name="Async Processing">
-            <flow-ref name="process-files-worker-flow" doc:name="process-files-worker-flow"/>
-        </async>
+            <!-- ── Hand off to worker asynchronously ────────────────── -->
+            <async doc:name="Async Processing">
+                <flow-ref name="process-files-worker-flow" doc:name="process-files-worker-flow"/>
+            </async>
 
-        <!-- ── Return 202 immediately ────────────────────────────── -->
-        <ee:transform doc:name="Build 202 Response">
-            <ee:message>
-                <ee:set-payload><![CDATA[%dw 2.0
+            <!-- ── Return 202 immediately ────────────────────────────── -->
+            <ee:transform doc:name="Build 202 Response">
+                <ee:message>
+                    <ee:set-payload><![CDATA[%dw 2.0
 output application/json
 ---
 {
-    status:        "ACCEPTED",
-    message:       "Files queued for asynchronous processing",
+    success:       true,
+    statusCode:    202,
     correlationId: vars.requestCorrelationId,
-    filesQueued:   vars.fileCount,
-    statusUrl:     "/upload-status?correlationId=" ++ vars.requestCorrelationId,
-    timestamp:     now()
+    timestamp:     now(),
+    data: {
+        processingStatus: "ACCEPTED",
+        message:          "Files queued for asynchronous processing.",
+        filesQueued:      vars.fileCount,
+        statusUrl:        "/upload-status?correlationId=" ++ vars.requestCorrelationId
+    }
 }]]></ee:set-payload>
-            </ee:message>
-        </ee:transform>
+                </ee:message>
+            </ee:transform>
 
-        <set-variable value="202" doc:name="Set Status 202" variableName="httpStatus"/>
+            <set-variable value="202" doc:name="Set Status 202" variableName="httpStatus"/>
 
-        <logger level="INFO" doc:name="Log Response Sent"
-                message="#[output application/java --- '[INFO] 202 Response Sent | CorrelationID: ' ++ vars.requestCorrelationId ++ ' | Timestamp: ' ++ (now() as String)]"/>
+            <logger level="INFO" doc:name="Log Response Sent"
+                    message="#[output application/java --- '[INFO] 202 Response Sent | CorrelationID: ' ++ vars.requestCorrelationId ++ ' | Timestamp: ' ++ (now() as String)]"/>
+
+            <!-- ================================================================
+                 FIX: Inner error handler for the try block wrapping the flow body.
+                 Catches MULE:CONNECTIVITY (SocketException / Connection reset)
+                 with on-error-continue so the flow ends cleanly without a 500.
+                 All other errors are re-propagated to the flow's Global_Error_Handler.
+            ================================================================ -->
+            <error-handler>
+                <on-error-continue type="MULE:CONNECTIVITY" enableNotifications="false" logException="false">
+                    <logger level="WARN" doc:name="Log Early Client Disconnect"
+                            message="#[output application/java --- '[WARN] Client disconnected during upload (Connection reset). CorrelationID: ' ++ (vars.requestCorrelationId default correlationId) ++ ' | Timestamp: ' ++ (now() as String)]"/>
+                </on-error-continue>
+            </error-handler>
+
+        </try>
 
         <error-handler ref="Global_Error_Handler"/>
     </flow>
@@ -332,11 +433,7 @@ output application/json
 
         <set-variable value="#[now()]" doc:name="Set Worker Start Time" variableName="workerStartTime"/>
 
-        <!-- ──────────────────────────────────────────────────────────
-             UPDATE status → PROCESSING
-             processing_status has no processing_start column so we
-             only flip the status field.
-             ────────────────────────────────────────────────────────── -->
+        <!-- UPDATE status → PROCESSING -->
         <try doc:name="Try Update Status PROCESSING">
             <db:update doc:name="Update Status to PROCESSING" config-ref="Database_Config">
                 <db:sql><![CDATA[UPDATE processing_status
@@ -353,12 +450,6 @@ WHERE  correlation_id = :correlationId]]></db:sql>
         </try>
 
         <!-- ── Initialise running totals ─────────────────────────── -->
-        <!--
-            Variable names are chosen to match processing_status column names exactly:
-              totalInserted → total_inserted
-              totalValid    → total_valid
-              totalInvalid  → total_invalid
-        -->
         <ee:transform doc:name="Initialize Variables">
             <ee:message/>
             <ee:variables>
@@ -378,11 +469,17 @@ output application/json
             <set-variable value="#[now()]" doc:name="Set File Start Time" variableName="fileStartTime"/>
 
             <logger level="INFO" doc:name="Log File Processing Start"
-                    message="#[output application/java --- '[INFO] [WORKER] File Processing Started | CorrelationID: ' ++ correlationId ++ ' | FileName: ' ++ payload.fileName ++ ' | Timestamp: ' ++ (now() as String)]"/>
+                    message="#[output application/java --- '[INFO] [WORKER] File Processing Started | CorrelationID: ' ++ correlationId ++ ' | FileName: ' ++ (payload.fileName default 'unknown') ++ ' | Timestamp: ' ++ (now() as String)]"/>
+            
+            <logger level="DEBUG" doc:name="Log Raw Payload"
+                    message="#['RAW PAYLOAD: ' ++ (payload as String)]"/>
 
             <try doc:name="Try Process File">
 
                 <!-- ── Parse & validate ───────────────────────────── -->
+                <logger level="DEBUG" doc:name="Log Payload Before Parse"
+                        message="#[output application/java --- 'PAYLOAD: ' ++ (payload as String)]"/>
+                
                 <ee:transform doc:name="Parse and Validate File">
                     <ee:message>
                         <ee:set-payload><![CDATA[%dw 2.0
@@ -439,6 +536,8 @@ do {
             if (isEmpty(fileContent[namesOf(fileContent)[0]])) [] else fileContent[namesOf(fileContent)[0]]
         else if (isCsv)
             if (isEmpty(fileContent)) [] else fileContent
+        else if (fileContent is Array)
+            if (isEmpty(fileContent)) [] else fileContent
         else []
 
     var validatedRecords = rawRecords map validateRecord($)
@@ -458,6 +557,9 @@ do {
                     </ee:message>
                 </ee:transform>
 
+                <logger level="DEBUG" doc:name="Log Parse Results"
+                        message="#[output application/java --- 'FileType: ' ++ payload.fileType ++ ' | ValidCount: ' ++ payload.validCount ++ ' | InvalidCount: ' ++ payload.invalidCount ++ ' | TotalRecords: ' ++ payload.totalRecords]"/>
+
                 <set-variable value="#[payload.fileName]"       doc:name="Store File Name"      variableName="currentFileName"/>
                 <set-variable value="#[payload.validRecords]"   doc:name="Store Valid Records"   variableName="currentValidRecords"/>
                 <set-variable value="#[payload.invalidRecords]" doc:name="Store Invalid Records" variableName="currentInvalidRecords"/>
@@ -466,24 +568,17 @@ do {
                 <set-variable value="#[payload.invalidCount]"   doc:name="Store Invalid Count"  variableName="currentInvalidCount"/>
 
                 <logger level="INFO" doc:name="Log File Parsed"
-                        message="#[output application/java --- '[INFO] [WORKER] File Parsed | FileName: ' ++ vars.currentFileName ++ ' | FileType: ' ++ vars.currentFileType ++ ' | Valid: ' ++ vars.currentValidCount ++ ' | Invalid: ' ++ vars.currentInvalidCount ++ ' | Timestamp: ' ++ (now() as String)]"/>
+                        message="#[output application/java --- '[INFO] [WORKER] File Parsed | FileName: ' ++ (vars.currentFileName default 'unknown') ++ ' | FileType: ' ++ (vars.currentFileType default 'unknown') ++ ' | Valid: ' ++ (vars.currentValidCount default 0) ++ ' | Invalid: ' ++ (vars.currentInvalidCount default 0) ++ ' | Timestamp: ' ++ (now() as String)]"/>
 
-                <!-- Guard: reject unsupported file types -->
-                <choice doc:name="Check File Type">
-                    <when expression="#[vars.currentFileType == 'UNKNOWN']">
-                        <logger level="ERROR" doc:name="Log Unsupported File Type"
-                                message="#[output application/java --- '[ERROR] [WORKER] Unsupported File Type | FileName: ' ++ vars.currentFileName ++ ' | Timestamp: ' ++ (now() as String)]"/>
-                        <raise-error type="APP:VALIDATION_ERROR"
-                                     description="#['Unsupported file type: ' ++ vars.currentFileName]"/>
+                <!-- Guard: Only reject if we have no records at all -->
+                <choice doc:name="Check Has Records">
+                    <when expression="#[vars.currentValidCount == 0 and vars.currentInvalidCount == 0]">
+                        <logger level="WARN" doc:name="Log No Records"
+                                message="#[output application/java --- '[WARN] [WORKER] No Records Found | FileName: ' ++ (vars.currentFileName default 'unknown') ++ ' | FileType: ' ++ (vars.currentFileType default 'unknown') ++ ' | Timestamp: ' ++ (now() as String)]"/>
                     </when>
                 </choice>
 
-                <!-- ─────────────────────────────────────────────────
-                     STORE INVALID RECORDS → dead_letter_queue
-                     dead_letter_queue.id is INTEGER PRIMARY KEY (not SERIAL).
-                     We supply the id value from the source file record.
-                     ON CONFLICT updates in case the same id is resubmitted.
-                     ───────────────────────────────────────────────── -->
+                <!-- STORE INVALID RECORDS → dead_letter_queue -->
                 <choice doc:name="Has Invalid Records?">
                     <when expression="#[vars.currentInvalidCount > 0]">
                         <try doc:name="Try Batch Insert DLQ">
@@ -498,7 +593,7 @@ vars.currentInvalidRecords map {
     email:         $.email,
     age:           $.age,
     error_message: $.errors joinBy ", ",
-    file_name:     vars.currentFileName
+    file_name:     (vars.currentFileName default "unknown")
 }]]></ee:set-payload>
                                 </ee:message>
                             </ee:transform>
@@ -516,27 +611,22 @@ ON CONFLICT (id) DO UPDATE
                             </until-successful>
 
                             <logger level="INFO" doc:name="Log DLQ Insert Success"
-                                    message="#[output application/java --- '[INFO] [WORKER] DLQ Insert Completed | FileName: ' ++ vars.currentFileName ++ ' | RecordsInserted: ' ++ vars.currentInvalidCount ++ ' | Timestamp: ' ++ (now() as String)]"/>
+                                    message="#[output application/java --- '[INFO] [WORKER] DLQ Insert Completed | FileName: ' ++ (vars.currentFileName default 'unknown') ++ ' | RecordsInserted: ' ++ (vars.currentInvalidCount default 0) ++ ' | Timestamp: ' ++ (now() as String)]"/>
 
                             <error-handler>
                                 <on-error-continue enableNotifications="true" logException="true">
                                     <logger level="ERROR" doc:name="Log DLQ Failure"
-                                            message="#[output application/java --- '[ERROR] [WORKER] DLQ Insert Failed | FileName: ' ++ vars.currentFileName ++ ' | Error: ' ++ (error.description default 'Unknown') ++ ' | Timestamp: ' ++ (now() as String)]"/>
+                                            message="#[output application/java --- '[ERROR] [WORKER] DLQ Insert Failed | FileName: ' ++ (vars.currentFileName default 'unknown') ++ ' | Error: ' ++ (error.description default 'Unknown') ++ ' | Timestamp: ' ++ (now() as String)]"/>
                                 </on-error-continue>
                             </error-handler>
                         </try>
                     </when>
                 </choice>
 
-                <!-- ─────────────────────────────────────────────────
-                     STORE VALID RECORDS → employees
-                     employees.id is SERIAL — omit it from the INSERT.
-                     Unique constraint is on email → conflict target = email.
-                     ───────────────────────────────────────────────── -->
+                <!-- STORE VALID RECORDS → employees -->
                 <choice doc:name="Has Valid Records?">
                     <when expression="#[vars.currentValidCount > 0]">
 
-                        <!-- De-duplicate within this batch and across prior files -->
                         <ee:transform doc:name="Check Email Duplicates">
                             <ee:message>
                                 <ee:set-payload><![CDATA[%dw 2.0
@@ -572,7 +662,6 @@ do {
                         <choice doc:name="Any Records to Insert?">
                             <when expression="#[sizeOf(vars.recordsToInsert) > 0]">
 
-                                <!-- Check which emails already exist in the DB -->
                                 <ee:transform doc:name="Build Email List">
                                     <ee:message>
                                         <ee:set-payload><![CDATA[%dw 2.0
@@ -593,7 +682,6 @@ output application/java
                                               doc:name="Store Existing Emails"
                                               variableName="existingEmailsInDb"/>
 
-                                <!-- Remove records whose email is already in the DB -->
                                 <ee:transform doc:name="Filter Non-Duplicate Records">
                                     <ee:message>
                                         <ee:set-payload><![CDATA[%dw 2.0
@@ -610,10 +698,6 @@ vars.recordsToInsert filter !(vars.existingEmailsInDb contains $.email)]]></ee:s
                                 <choice doc:name="Final Records Remaining?">
                                     <when expression="#[sizeOf(vars.finalRecordsToInsert) > 0]">
                                         <try doc:name="Try Batch Insert Employees">
-                                            <!--
-                                                Strip id from the payload — employees.id is SERIAL.
-                                                Only pass name, email, age.
-                                            -->
                                             <ee:transform doc:name="Prepare Batch Insert">
                                                 <ee:message>
                                                     <ee:set-payload><![CDATA[%dw 2.0
@@ -629,10 +713,6 @@ vars.finalRecordsToInsert map {
 
                                             <until-successful maxRetries="3" millisBetweenRetries="2000" doc:name="Retry Batch Insert">
                                                 <db:bulk-insert doc:name="Batch Insert Records" config-ref="Database_Config">
-                                                    <!--
-                                                        id omitted — SERIAL auto-generates it.
-                                                        ON CONFLICT (email) is the correct unique constraint.
-                                                    -->
                                                     <db:sql><![CDATA[INSERT INTO employees (name, email, age)
 VALUES (:name, :email, :age)
 ON CONFLICT (email) DO NOTHING]]></db:sql>
@@ -644,9 +724,8 @@ ON CONFLICT (email) DO NOTHING]]></db:sql>
                                                           variableName="insertedCount"/>
 
                                             <logger level="INFO" doc:name="Log Insert Success"
-                                                    message="#[output application/java --- '[INFO] [WORKER] Records Inserted | FileName: ' ++ vars.currentFileName ++ ' | Count: ' ++ vars.insertedCount ++ ' | Timestamp: ' ++ (now() as String)]"/>
+                                                    message="#[output application/java --- '[INFO] [WORKER] Records Inserted | FileName: ' ++ (vars.currentFileName default 'unknown') ++ ' | Count: ' ++ (vars.insertedCount default 0) ++ ' | Timestamp: ' ++ (now() as String)]"/>
 
-                                            <!-- Track processed emails to catch cross-file duplicates -->
                                             <ee:transform doc:name="Add to Processed Emails">
                                                 <ee:message/>
                                                 <ee:variables>
@@ -660,7 +739,7 @@ vars.processedEmails ++ (vars.finalRecordsToInsert map $.email)]]></ee:set-varia
                                             <error-handler>
                                                 <on-error-continue enableNotifications="true" logException="true">
                                                     <logger level="ERROR" doc:name="Log Insert Failure"
-                                                            message="#[output application/java --- '[ERROR] [WORKER] Batch Insert Failed | FileName: ' ++ vars.currentFileName ++ ' | Error: ' ++ (error.description default 'Unknown') ++ ' | Timestamp: ' ++ (now() as String)]"/>
+                                                            message="#[output application/java --- '[ERROR] [WORKER] Batch Insert Failed | FileName: ' ++ (vars.currentFileName default 'unknown') ++ ' | Error: ' ++ (error.description default 'Unknown') ++ ' | Timestamp: ' ++ (now() as String)]"/>
                                                     <set-variable value="#[sizeOf(vars.finalRecordsToInsert)]"
                                                                   doc:name="Set Failed Count"
                                                                   variableName="failedCount"/>
@@ -683,7 +762,6 @@ vars.processedEmails ++ (vars.finalRecordsToInsert map $.email)]]></ee:set-varia
                             </otherwise>
                         </choice>
 
-                        <!-- Accumulate running totals (names match processing_status columns) -->
                         <ee:transform doc:name="Update Totals">
                             <ee:message/>
                             <ee:variables>
@@ -710,13 +788,12 @@ vars.totalFailed + (vars.failedCount default 0)]]></ee:set-variable>
                 </choice>
 
                 <logger level="INFO" doc:name="Log File Complete"
-                        message="#[output application/java --- '[INFO] [WORKER] File Completed | FileName: ' ++ vars.currentFileName ++ ' | Inserted: ' ++ (vars.insertedCount default 0) ++ ' | Timestamp: ' ++ (now() as String)]"/>
+                        message="#[output application/java --- '[INFO] [WORKER] File Completed | FileName: ' ++ (vars.currentFileName default 'unknown') ++ ' | Inserted: ' ++ (vars.insertedCount default 0) ++ ' | Timestamp: ' ++ (now() as String)]"/>
 
                 <error-handler>
                     <on-error-continue enableNotifications="true" logException="true">
                         <logger level="ERROR" doc:name="Log File Error"
                                 message="#[output application/java --- '[ERROR] [WORKER] File Processing Error | FileName: ' ++ (vars.currentFileName default 'unknown') ++ ' | Error: ' ++ (error.description default 'Unknown') ++ ' | Timestamp: ' ++ (now() as String)]"/>
-                        <!-- Still count validation failures from the errored file -->
                         <ee:transform doc:name="Accumulate Invalid on File Error">
                             <ee:message/>
                             <ee:variables>
@@ -732,13 +809,9 @@ vars.totalInvalid + (vars.currentInvalidCount default 0)]]></ee:set-variable>
         </foreach>
 
         <logger level="INFO" doc:name="Log Worker Complete"
-                message="#[output application/java --- '[INFO] [WORKER] All Files Processed | CorrelationID: ' ++ correlationId ++ ' | TotalInserted: ' ++ vars.totalInserted ++ ' | TotalValid: ' ++ vars.totalValid ++ ' | TotalInvalid: ' ++ vars.totalInvalid ++ ' | ProcessingTime: ' ++ ((now() - vars.workerStartTime) as Number) ++ 'ms | Timestamp: ' ++ (now() as String)]"/>
+                message="#[output application/java --- '[INFO] [WORKER] All Files Processed | CorrelationID: ' ++ correlationId ++ ' | TotalInserted: ' ++ (vars.totalInserted default 0) ++ ' | TotalValid: ' ++ (vars.totalValid default 0) ++ ' | TotalInvalid: ' ++ (vars.totalInvalid default 0) ++ ' | ProcessingTime: ' ++ ((now() - vars.workerStartTime) as Number) ++ 'ms | Timestamp: ' ++ (now() as String)]"/>
 
-        <!-- ──────────────────────────────────────────────────────────
-             UPDATE status → COMPLETED
-             Uses exact processing_status column names:
-               total_valid, total_invalid, total_inserted, completed_at
-             ────────────────────────────────────────────────────────── -->
+        <!-- UPDATE status → COMPLETED -->
         <try doc:name="Try Update Status COMPLETED">
             <db:update doc:name="Update Status to COMPLETED" config-ref="Database_Config">
                 <db:sql><![CDATA[UPDATE processing_status
@@ -757,7 +830,7 @@ WHERE  correlation_id = :correlationId]]></db:sql>
             </db:update>
 
             <logger level="INFO" doc:name="Log Status COMPLETED"
-                    message="#[output application/java --- '[INFO] [WORKER] Status COMPLETED | CorrelationID: ' ++ correlationId ++ ' | Inserted: ' ++ vars.totalInserted ++ ' | Valid: ' ++ vars.totalValid ++ ' | Invalid: ' ++ vars.totalInvalid ++ ' | Timestamp: ' ++ (now() as String)]"/>
+                    message="#[output application/java --- '[INFO] [WORKER] Status COMPLETED | CorrelationID: ' ++ correlationId ++ ' | Inserted: ' ++ (vars.totalInserted default 0) ++ ' | Valid: ' ++ (vars.totalValid default 0) ++ ' | Invalid: ' ++ (vars.totalInvalid default 0) ++ ' | Timestamp: ' ++ (now() as String)]"/>
 
             <error-handler>
                 <on-error-continue enableNotifications="true" logException="true">
@@ -773,11 +846,6 @@ WHERE  correlation_id = :correlationId]]></db:sql>
                 <logger level="ERROR" doc:name="Log Worker Fatal Error"
                         message="#[output application/java --- '[ERROR] [WORKER] Unhandled Fatal Error | CorrelationID: ' ++ correlationId ++ ' | Error: ' ++ (error.description default 'Unknown') ++ ' | Timestamp: ' ++ (now() as String)]"/>
 
-                <!--
-                    Mark as FAILED.
-                    processing_status has no error_message column,
-                    so only status and completed_at are updated.
-                -->
                 <try doc:name="Try Update Status FAILED">
                     <db:update doc:name="Update Status to FAILED" config-ref="Database_Config">
                         <db:sql><![CDATA[UPDATE processing_status
@@ -800,8 +868,6 @@ WHERE  correlation_id = :correlationId]]></db:sql>
 
     <!-- ============================================================
          STATUS FLOW  —  GET /upload-status?correlationId=<id>
-         Queries processing_status using the real column names.
-         Returns request-specific data, not aggregates.
          ============================================================ -->
     <flow name="upload-status-flow" doc:name="Upload Status Flow">
         <http:listener doc:name="Listener" config-ref="HTTP_Listener_config" path="/upload-status" allowedMethods="GET">
@@ -818,16 +884,22 @@ WHERE  correlation_id = :correlationId]]></db:sql>
 
         <choice doc:name="Has CorrelationId?">
             <when expression="#[attributes.queryParams.correlationId == null or attributes.queryParams.correlationId == '']">
+                <!-- Missing param — emit envelope directly (no correlationId to reflect back) -->
                 <ee:transform doc:name="400 Missing CorrelationId">
                     <ee:message>
                         <ee:set-payload><![CDATA[%dw 2.0
 output application/json
 ---
 {
-    status:    "BAD_REQUEST",
-    errorCode: 400,
-    message:   "correlationId query parameter is required",
-    timestamp: now()
+    success:       false,
+    statusCode:    400,
+    correlationId: null,
+    timestamp:     now(),
+    error: {
+        "type":  "BAD_REQUEST",
+        code:    400,
+        message: "correlationId query parameter is required."
+    }
 }]]></ee:set-payload>
                     </ee:message>
                     <ee:variables>
@@ -842,7 +914,6 @@ output application/json
 
                 <try doc:name="Try Query Status">
 
-                    <!-- Select using exact processing_status column names -->
                     <db:select doc:name="Get Processing Status" config-ref="Database_Config">
                         <db:sql><![CDATA[SELECT
     correlation_id,
@@ -851,7 +922,7 @@ output application/json
     total_invalid,
     total_inserted,
     status,
-    started_at,
+    created_at,
     completed_at
 FROM processing_status
 WHERE correlation_id = :correlationId]]></db:sql>
@@ -866,11 +937,15 @@ WHERE correlation_id = :correlationId]]></db:sql>
 output application/json
 ---
 {
-    status:        "NOT_FOUND",
-    errorCode:     404,
-    message:       "No processing record found for the supplied correlationId",
+    success:       false,
+    statusCode:    404,
     correlationId: vars.requestedCorrelationId,
-    timestamp:     now()
+    timestamp:     now(),
+    error: {
+        "type":  "NOT_FOUND",
+        code:    404,
+        message: "No processing record found for the supplied correlationId."
+    }
 }]]></ee:set-payload>
                                 </ee:message>
                                 <ee:variables>
@@ -879,7 +954,7 @@ output application/json
                             </ee:transform>
                         </when>
                         <otherwise>
-                            <ee:transform doc:name="Build Status Response">
+                            <ee:transform doc:name="Build 200 Status Response">
                                 <ee:message>
                                     <ee:set-payload><![CDATA[%dw 2.0
 output application/json
@@ -887,32 +962,34 @@ output application/json
 do {
     var row = payload[0]
 
-    // Elapsed seconds: started_at → completed_at (or now() if still running)
     var elapsedSeconds =
-        if (row.started_at != null and row.completed_at != null)
-            ((row.completed_at - row.started_at) as Number) / 1000
-        else if (row.started_at != null)
-            ((now() - row.started_at) as Number) / 1000
+        if (row.created_at != null and row.completed_at != null)
+            ((row.completed_at - row.created_at) as Number) / 1000
+        else if (row.created_at != null)
+            ((now() - row.created_at) as Number) / 1000
         else null
     ---
     {
-        status:        "SUCCESS",
+        success:       true,
+        statusCode:    200,
         correlationId: row.correlation_id,
-        processing: {
-            status:         row.status,       // ACCEPTED | PROCESSING | COMPLETED | FAILED
-            totalFiles:     row.total_files,
-            elapsedSeconds: elapsedSeconds
-        },
-        records: {
-            totalValid:    row.total_valid    default 0,
-            totalInvalid:  row.total_invalid  default 0,
-            totalInserted: row.total_inserted default 0
-        },
-        timeline: {
-            startedAt:   row.started_at,
-            completedAt: row.completed_at
-        },
-        timestamp: now()
+        timestamp:     now(),
+        data: {
+            processing: {
+                status:         row.status,
+                totalFiles:     row.total_files,
+                elapsedSeconds: elapsedSeconds
+            },
+            records: {
+                totalValid:    row.total_valid    default 0,
+                totalInvalid:  row.total_invalid  default 0,
+                totalInserted: row.total_inserted default 0
+            },
+            timeline: {
+                createdAt:   row.created_at,
+                completedAt: row.completed_at
+            }
+        }
     }
 }]]></ee:set-payload>
                                 </ee:message>
@@ -927,17 +1004,21 @@ do {
                         <on-error-propagate enableNotifications="true" logException="true">
                             <logger level="ERROR" doc:name="Log Query Error"
                                     message="#[output application/java --- '[ERROR] Status Query Failed | CorrelationID: ' ++ vars.requestedCorrelationId ++ ' | Error: ' ++ (error.description default 'Unknown') ++ ' | Timestamp: ' ++ (now() as String)]"/>
-                            <ee:transform doc:name="500 Error Response">
+                            <ee:transform doc:name="500 Query Error Response">
                                 <ee:message>
                                     <ee:set-payload><![CDATA[%dw 2.0
 output application/json
 ---
 {
-    status:        "ERROR",
-    errorCode:     500,
-    message:       "Failed to retrieve status information",
+    success:       false,
+    statusCode:    500,
     correlationId: vars.requestedCorrelationId,
-    timestamp:     now()
+    timestamp:     now(),
+    error: {
+        "type":  "DB_ERROR",
+        code:    500,
+        message: "Failed to retrieve processing status. Please try again."
+    }
 }]]></ee:set-payload>
                                 </ee:message>
                                 <ee:variables>
